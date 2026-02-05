@@ -1,0 +1,19 @@
+[package]
+name = "mark"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.27"
+dirs = "5.0"
+notify = "6.1"
+pulldown-cmark = "0.10"
+ratatui = "0.26"
+ropey = "1.6"
+serde = { version = "1.0", features = ["derive"] }
+shell-words = "1.1"
+syntect = "5.3"
+toml = "0.8"
+unicode-width = "0.1"
