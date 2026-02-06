@@ -1,5 +1,5 @@
 use anyhow::Result;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
@@ -11,12 +11,16 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[derive(Debug, Clone, Copy)]
 pub struct MarkdownStyles {
     pub base: Style,
-    pub heading: Style,
+    pub heading: [Style; 6],
     pub link_color: Color,
     pub inline_code: Style,
     pub prefix: Style,
     pub rule: Style,
     pub code_bg: Option<Color>,
+    pub code_border: Style,
+    pub code_header: Style,
+    pub table_border: Style,
+    pub table_header: Style,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +77,7 @@ pub fn parse_markdown(
     let mut line = LineBuilder::new();
     let mut heading: Option<HeadingBuilder> = None;
     let mut code_block: Option<CodeBlock> = None;
+    let mut table: Option<TableBuilder> = None;
     let mut list_stack: Vec<ListKind> = Vec::new();
     let mut pending_list_prefix: Option<String> = None;
     let mut blockquote_level: usize = 0;
@@ -83,10 +88,12 @@ pub fn parse_markdown(
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
-                    line.ensure_prefix(
-                        &current_prefix(blockquote_level, pending_list_prefix.as_deref()),
-                        styles.prefix,
-                    );
+                    if table.is_none() {
+                        line.ensure_prefix(
+                            &current_prefix(blockquote_level, pending_list_prefix.as_deref()),
+                            styles.prefix,
+                        );
+                    }
                 }
                 Tag::Heading { level, .. } => {
                     flush_line(&mut line, &mut raw_lines);
@@ -95,6 +102,25 @@ pub fn parse_markdown(
                 Tag::CodeBlock(kind) => {
                     flush_line(&mut line, &mut raw_lines);
                     code_block = Some(CodeBlock::new(kind));
+                }
+                Tag::Table(alignments) => {
+                    flush_line(&mut line, &mut raw_lines);
+                    table = Some(TableBuilder::new(alignments));
+                }
+                Tag::TableHead => {
+                    if let Some(table) = table.as_mut() {
+                        table.in_head = true;
+                    }
+                }
+                Tag::TableRow => {
+                    if let Some(table) = table.as_mut() {
+                        table.start_row();
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(table) = table.as_mut() {
+                        table.start_cell();
+                    }
                 }
                 Tag::List(start) => list_stack.push(ListKind::from(start)),
                 Tag::Item => {
@@ -120,14 +146,28 @@ pub fn parse_markdown(
             },
             Event::End(tag) => match tag {
                 TagEnd::Paragraph => {
-                    flush_line(&mut line, &mut raw_lines);
-                    push_blank_line(&mut raw_lines);
+                    if table.is_none() {
+                        flush_line(&mut line, &mut raw_lines);
+                        push_blank_line(&mut raw_lines);
+                    }
                 }
                 TagEnd::Heading(_) => {
                     if let Some(h) = heading.take() {
                         let text = h.text.trim().to_string();
                         let raw_line = raw_lines.len();
-                        raw_lines.push(Line::from(Span::styled(text.clone(), styles.heading)));
+                        if h.level <= 2 && !raw_lines.is_empty() {
+                            push_blank_line(&mut raw_lines);
+                        }
+                        raw_lines.push(Line::from(Span::styled(
+                            text.clone(),
+                            heading_style(styles, h.level),
+                        )));
+                        if h.level <= 2 {
+                            let ch = if h.level == 1 { '═' } else { '─' };
+                            let underline =
+                                ch.to_string().repeat(text.chars().count().clamp(4, 48));
+                            raw_lines.push(Line::from(Span::styled(underline, styles.rule)));
+                        }
                         // plain lines are reconstructed later from spans
                         headings.push(HeadingRaw {
                             level: h.level,
@@ -139,8 +179,30 @@ pub fn parse_markdown(
                 }
                 TagEnd::CodeBlock => {
                     if let Some(block) = code_block.take() {
-                        render_code_block(&block, syntax_set, theme, styles.code_bg, &mut raw_lines);
+                        render_code_block(&block, syntax_set, theme, styles, &mut raw_lines);
                         push_blank_line(&mut raw_lines);
+                    }
+                }
+                TagEnd::Table => {
+                    if let Some(mut table_state) = table.take() {
+                        table_state.end_row();
+                        render_table(&table_state, styles, &mut raw_lines);
+                        push_blank_line(&mut raw_lines);
+                    }
+                }
+                TagEnd::TableHead => {
+                    if let Some(table) = table.as_mut() {
+                        table.in_head = false;
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(table) = table.as_mut() {
+                        table.end_row();
+                    }
+                }
+                TagEnd::TableCell => {
+                    if let Some(table) = table.as_mut() {
+                        table.end_cell();
                     }
                 }
                 TagEnd::List(_) => {
@@ -163,7 +225,9 @@ pub fn parse_markdown(
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some(h) = heading.as_mut() {
+                if let Some(table) = table.as_mut() {
+                    table.push_text(&text);
+                } else if let Some(h) = heading.as_mut() {
                     h.text.push_str(&text);
                 } else if let Some(block) = code_block.as_mut() {
                     block.text.push_str(&text);
@@ -176,7 +240,9 @@ pub fn parse_markdown(
                 }
             }
             Event::Code(text) => {
-                if let Some(h) = heading.as_mut() {
+                if let Some(table) = table.as_mut() {
+                    table.push_text(&text);
+                } else if let Some(h) = heading.as_mut() {
                     h.text.push_str(&text);
                 } else if let Some(block) = code_block.as_mut() {
                     block.text.push_str(&text);
@@ -189,7 +255,9 @@ pub fn parse_markdown(
                 }
             }
             Event::SoftBreak => {
-                if let Some(block) = code_block.as_mut() {
+                if let Some(table) = table.as_mut() {
+                    table.push_break();
+                } else if let Some(block) = code_block.as_mut() {
                     block.text.push('\n');
                 } else {
                     line.ensure_prefix(
@@ -200,7 +268,11 @@ pub fn parse_markdown(
                 }
             }
             Event::HardBreak => {
-                flush_line(&mut line, &mut raw_lines);
+                if let Some(table) = table.as_mut() {
+                    table.push_break();
+                } else {
+                    flush_line(&mut line, &mut raw_lines);
+                }
             }
             Event::Rule => {
                 flush_line(&mut line, &mut raw_lines);
@@ -335,6 +407,11 @@ pub fn find_matches(lines: &[String], query: &str, case_sensitive: bool) -> Vec<
     out
 }
 
+fn heading_style(styles: &MarkdownStyles, level: u8) -> Style {
+    let idx = level.saturating_sub(1).min(5) as usize;
+    styles.heading[idx]
+}
+
 fn build_match_map(matches: &[Match]) -> std::collections::HashMap<usize, Vec<std::ops::Range<usize>>> {
     let mut map: std::collections::HashMap<usize, Vec<std::ops::Range<usize>>> =
         std::collections::HashMap::new();
@@ -413,8 +490,15 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
         return vec![line.clone()];
     }
 
+    let fill_bg = line_uniform_bg(line);
+    let fill_style = fill_bg.map(|bg| Style::default().bg(bg));
+    let fill_width = if width > 500 { None } else { Some(width) };
+
     let tokens = tokenize_line(line);
     if tokens.is_empty() {
+        if let (Some(style), Some(fill_width)) = (fill_style, fill_width) {
+            return vec![Line::from(Span::styled(" ".repeat(fill_width), style))];
+        }
         return vec![Line::from("")];
     }
 
@@ -424,11 +508,21 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 
     let push_current = |current: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>| {
         if current.is_empty() {
-            out.push(Line::from(""));
-        } else {
-            trim_trailing_ws(current);
-            out.push(Line::from(current.drain(..).collect::<Vec<_>>()));
+            if let (Some(style), Some(fill_width)) = (fill_style, fill_width) {
+                out.push(Line::from(Span::styled(" ".repeat(fill_width), style)));
+            } else {
+                out.push(Line::from(""));
+            }
+            return;
         }
+        trim_trailing_ws(current);
+        if let (Some(style), Some(fill_width)) = (fill_style, fill_width) {
+            let width_now = spans_width(current);
+            if width_now < fill_width {
+                current.push(Span::styled(" ".repeat(fill_width - width_now), style));
+            }
+        }
+        out.push(Line::from(current.drain(..).collect::<Vec<_>>()));
     };
 
     for token in tokens {
@@ -498,6 +592,34 @@ fn trim_trailing_ws(spans: &mut Vec<Span<'static>>) {
     }
 }
 
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+fn line_uniform_bg(line: &Line<'static>) -> Option<Color> {
+    let mut bg: Option<Color> = None;
+    for span in &line.spans {
+        if span.content.is_empty() {
+            continue;
+        }
+        let Some(color) = span.style.bg else {
+            return None;
+        };
+        if color == Color::Reset {
+            return None;
+        }
+        match bg {
+            Some(existing) if existing != color => return None,
+            Some(_) => {}
+            None => bg = Some(color),
+        }
+    }
+    bg
+}
+
 fn tokenize_line(line: &Line<'static>) -> Vec<Token> {
     let mut tokens = Vec::new();
     for span in &line.spans {
@@ -542,23 +664,175 @@ fn line_to_plain(line: &Line<'static>) -> String {
     out
 }
 
+fn render_table(table: &TableBuilder, styles: &MarkdownStyles, raw_lines: &mut Vec<Line<'static>>) {
+    if table.rows.is_empty() {
+        return;
+    }
+    let column_count = table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or(0);
+    if column_count == 0 {
+        return;
+    }
+
+    let mut widths = vec![0usize; column_count];
+    for row in &table.rows {
+        for (idx, cell) in row.cells.iter().enumerate() {
+            let width = UnicodeWidthStr::width(cell.as_str());
+            widths[idx] = widths[idx].max(width);
+        }
+    }
+
+    let border = styles.table_border;
+    raw_lines.push(table_border_line(
+        &widths,
+        ('┌', '┬', '┐'),
+        border,
+    ));
+
+    let mut header_len = 0usize;
+    for row in &table.rows {
+        if row.is_header {
+            header_len += 1;
+        } else {
+            break;
+        }
+    }
+
+    for row in table.rows.iter().take(header_len) {
+        raw_lines.push(table_row_line(
+            row,
+            &widths,
+            &table.alignments,
+            styles.table_header,
+            border,
+        ));
+    }
+    if header_len > 0 && header_len < table.rows.len() {
+        raw_lines.push(table_border_line(
+            &widths,
+            ('├', '┼', '┤'),
+            border,
+        ));
+    }
+    for row in table.rows.iter().skip(header_len) {
+        raw_lines.push(table_row_line(
+            row,
+            &widths,
+            &table.alignments,
+            styles.base,
+            border,
+        ));
+    }
+
+    raw_lines.push(table_border_line(
+        &widths,
+        ('└', '┴', '┘'),
+        border,
+    ));
+}
+
+fn table_border_line(
+    widths: &[usize],
+    joints: (char, char, char),
+    style: Style,
+) -> Line<'static> {
+    let mut line = String::new();
+    line.push(joints.0);
+    for (idx, width) in widths.iter().enumerate() {
+        line.push_str(&"─".repeat(width.saturating_add(2)));
+        if idx + 1 < widths.len() {
+            line.push(joints.1);
+        }
+    }
+    line.push(joints.2);
+    Line::from(Span::styled(line, style))
+}
+
+fn table_row_line(
+    row: &TableRow,
+    widths: &[usize],
+    alignments: &[Alignment],
+    cell_style: Style,
+    border_style: Style,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::styled("│", border_style));
+    for idx in 0..widths.len() {
+        let text = row.cells.get(idx).map(|s| s.as_str()).unwrap_or("");
+        let align = alignments
+            .get(idx)
+            .copied()
+            .unwrap_or(Alignment::Left);
+        let padded = pad_cell(text, widths[idx], align);
+        let cell_text = format!(" {padded} ");
+        spans.push(Span::styled(cell_text, cell_style));
+        spans.push(Span::styled("│", border_style));
+    }
+    Line::from(spans)
+}
+
+fn pad_cell(text: &str, width: usize, align: Alignment) -> String {
+    let text_width = UnicodeWidthStr::width(text);
+    if width <= text_width {
+        return text.to_string();
+    }
+    let pad = width - text_width;
+    match align {
+        Alignment::Right => format!("{}{}", " ".repeat(pad), text),
+        Alignment::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+        }
+        _ => format!("{}{}", text, " ".repeat(pad)),
+    }
+}
+
 fn render_code_block(
     block: &CodeBlock,
     syntax_set: &SyntaxSet,
     theme: &Theme,
-    code_bg: Option<Color>,
+    styles: &MarkdownStyles,
     raw_lines: &mut Vec<Line<'static>>,
 ) {
     let syntax = resolve_code_syntax(syntax_set, block.language.as_deref());
     let mut highlighter = HighlightLines::new(syntax, theme);
+    let code_bg = styles.code_bg;
+    let border_style = styles.code_border;
+    let header_style = styles.code_header;
+    let pad_style = Style::default().bg(code_bg.unwrap_or(Color::Reset));
 
-    let gutter_style = Style::default().bg(code_bg.unwrap_or(Color::Reset));
+    let label = block
+        .language
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("code");
+    let header = format!(" {label} ");
+    let cap_len = header.chars().count().saturating_add(2);
+    raw_lines.push(Line::from(vec![
+        Span::styled("╭", border_style),
+        Span::styled("─", border_style),
+        Span::styled(header, header_style),
+        Span::styled("╮", border_style),
+    ]));
+    raw_lines.push(Line::from(vec![
+        Span::styled("│ ", border_style),
+        Span::styled(" ", pad_style),
+    ]));
+
     for line in LinesWithEndings::from(&block.text) {
         let ranges = match highlighter.highlight_line(line, syntax_set) {
             Ok(r) => r,
             Err(_) => vec![(syntect::highlighting::Style::default(), line)],
         };
-        let mut spans = vec![Span::styled("  ", gutter_style)];
+        let mut spans = vec![
+            Span::styled("│ ", border_style),
+            Span::styled(" ", pad_style),
+        ];
         for (style, text) in ranges {
             let text = text.trim_end_matches('\n');
             if text.is_empty() {
@@ -569,11 +843,19 @@ fn render_code_block(
                 syntect_to_ratatui(style, code_bg),
             ));
         }
-        if spans.len() == 1 {
-            spans.push(Span::styled(" ", gutter_style));
-        }
+        spans.push(Span::styled(" ", pad_style));
         raw_lines.push(Line::from(spans));
     }
+
+    raw_lines.push(Line::from(vec![
+        Span::styled("│ ", border_style),
+        Span::styled(" ", pad_style),
+    ]));
+    raw_lines.push(Line::from(vec![
+        Span::styled("╰", border_style),
+        Span::styled("─".repeat(cap_len.saturating_sub(2)), border_style),
+        Span::styled("╯", border_style),
+    ]));
 }
 
 fn resolve_code_syntax<'a>(
@@ -725,8 +1007,17 @@ fn push_blank_line(raw_lines: &mut Vec<Line<'static>>) {
 }
 
 fn list_prefix(stack: &mut [ListKind]) -> String {
-    let indent = "  ".repeat(stack.len().saturating_sub(1));
-    let prefix = stack.last_mut().map(ListKind::prefix).unwrap_or("- ".to_string());
+    let depth = stack.len().max(1);
+    let indent = "  ".repeat(depth.saturating_sub(1));
+    let prefix = match stack.last_mut() {
+        Some(ListKind::Bullet) => format!("{} ", bullet_for_depth(depth)),
+        Some(ListKind::Ordered { next }) => {
+            let current = *next;
+            *next = next.saturating_add(1);
+            format!("{current}. ")
+        }
+        None => "- ".to_string(),
+    };
     format!("{indent}{prefix}")
 }
 
@@ -788,6 +1079,71 @@ impl CodeBlock {
     }
 }
 
+struct TableRow {
+    cells: Vec<String>,
+    is_header: bool,
+}
+
+struct TableBuilder {
+    alignments: Vec<Alignment>,
+    rows: Vec<TableRow>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_head: bool,
+}
+
+impl TableBuilder {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            rows: Vec::new(),
+            current_row: Vec::new(),
+            current_cell: String::new(),
+            in_head: false,
+        }
+    }
+
+    fn start_row(&mut self) {
+        self.current_row.clear();
+        self.current_cell.clear();
+    }
+
+    fn start_cell(&mut self) {
+        self.current_cell.clear();
+    }
+
+    fn push_text(&mut self, text: &str) {
+        self.current_cell.push_str(text);
+    }
+
+    fn push_break(&mut self) {
+        if !self.current_cell.ends_with(' ') {
+            self.current_cell.push(' ');
+        }
+    }
+
+    fn end_cell(&mut self) {
+        let cell = self.current_cell.trim().to_string();
+        self.current_row.push(cell);
+        self.current_cell.clear();
+    }
+
+    fn end_row(&mut self) {
+        if !self.current_cell.is_empty() {
+            self.end_cell();
+        }
+        if self.current_row.is_empty() {
+            return;
+        }
+        let row = TableRow {
+            cells: self.current_row.clone(),
+            is_header: self.in_head,
+        };
+        self.rows.push(row);
+        self.current_row.clear();
+    }
+}
+
 #[derive(Clone)]
 struct Token {
     text: String,
@@ -808,15 +1164,12 @@ impl ListKind {
             None => Self::Bullet,
         }
     }
+}
 
-    fn prefix(&mut self) -> String {
-        match self {
-            Self::Bullet => "- ".to_string(),
-            Self::Ordered { next } => {
-                let current = *next;
-                *next = next.saturating_add(1);
-                format!("{current}. ")
-            }
-        }
+fn bullet_for_depth(depth: usize) -> &'static str {
+    match depth % 3 {
+        1 => "•",
+        2 => "◦",
+        _ => "▪",
     }
 }

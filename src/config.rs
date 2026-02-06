@@ -16,6 +16,7 @@ pub struct Config {
     pub bat_theme_dir: Option<PathBuf>,
     pub tab_width: usize,
     pub forced_discover_dirs: Vec<PathBuf>,
+    pub preview_ratio: u16,
 }
 
 impl Default for Config {
@@ -29,6 +30,7 @@ impl Default for Config {
             bat_theme_dir: dirs::config_dir().map(|dir| dir.join("bat").join("themes")),
             tab_width: 4,
             forced_discover_dirs: default_forced_discover_dirs(),
+            preview_ratio: 55,
         }
     }
 }
@@ -43,6 +45,7 @@ struct PartialConfig {
     bat_theme_dir: Option<PathBuf>,
     tab_width: Option<usize>,
     forced_discover_dirs: Option<Vec<PathBuf>>,
+    preview_ratio: Option<u16>,
 }
 
 impl PartialConfig {
@@ -106,6 +109,13 @@ impl PartialConfig {
                 defaults.forced_discover_dirs
             }
         };
+        let preview_ratio = match self.preview_ratio {
+            Some(v) => v,
+            None => {
+                changed = true;
+                defaults.preview_ratio
+            }
+        };
 
         (
             Config {
@@ -114,13 +124,14 @@ impl PartialConfig {
                 outline_width,
                 wrap,
                 search_case_sensitive,
-                bat_theme_dir,
-                tab_width,
-                forced_discover_dirs,
-            },
-            changed,
-        )
-    }
+            bat_theme_dir,
+            tab_width,
+            forced_discover_dirs,
+            preview_ratio,
+        },
+        changed,
+    )
+}
 }
 
 fn default_forced_discover_dirs() -> Vec<PathBuf> {

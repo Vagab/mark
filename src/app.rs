@@ -65,8 +65,10 @@ pub fn run_app(path: PathBuf, mut config: Config) -> Result<AppExit> {
         app.ensure_rendered(render_width);
         app.sync_render_from_rope();
         app.clamp_scroll(render_height);
-        if app.show_preview {
+        if app.show_preview || app.show_outline {
             app.update_render_cursor_line();
+        }
+        if app.show_preview {
             app.ensure_rendered_cursor_visible(render_height);
         }
 
@@ -607,6 +609,7 @@ struct App {
     editor_cache_dirty: bool,
     show_help: bool,
     request_discover: bool,
+    preview_ratio: u16,
     rope: Rope,
 }
 
@@ -634,6 +637,7 @@ impl App {
             .iter()
             .position(|name| name == &config.theme)
             .unwrap_or(0);
+        let preview_ratio = config.preview_ratio;
         let mut registers = HashMap::new();
         registers.insert(
             '"',
@@ -695,6 +699,7 @@ impl App {
             editor_cache_dirty: true,
             show_help: false,
             request_discover: false,
+            preview_ratio,
             rope,
         })
     }
@@ -722,9 +727,10 @@ impl App {
         };
 
         let (editor, preview) = if self.show_preview {
+            let ratio = self.preview_ratio.clamp(20, 80);
             let split = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .constraints([Constraint::Percentage(ratio), Constraint::Percentage(100 - ratio)])
                 .split(body);
             (split[0], Some(split[1]))
         } else {
@@ -1097,6 +1103,19 @@ impl App {
         if self.consume_register_wait(key) {
             return false;
         }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.adjust_preview_ratio(5);
+                    return false;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.adjust_preview_ratio(-5);
+                    return false;
+                }
+                _ => {}
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('r') => {
@@ -1124,8 +1143,10 @@ impl App {
         }
         if handled_ctrl_move {
             self.ensure_cursor_visible(content_height);
-            if self.show_preview {
+            if self.show_preview || self.show_outline {
                 self.update_render_cursor_line();
+            }
+            if self.show_preview {
                 self.ensure_rendered_cursor_visible(content_height);
             }
             return false;
@@ -1303,8 +1324,10 @@ impl App {
             self.count = None;
         }
         self.ensure_cursor_visible(content_height);
-        if self.show_preview {
+        if self.show_preview || self.show_outline {
             self.update_render_cursor_line();
+        }
+        if self.show_preview {
             self.ensure_rendered_cursor_visible(content_height);
         }
         false
@@ -1353,9 +1376,11 @@ impl App {
         }
 
         self.ensure_cursor_visible(content_height);
-        if self.show_preview {
+        if self.show_preview || self.show_outline {
             self.sync_render_from_rope();
             self.update_render_cursor_line();
+        }
+        if self.show_preview {
             self.ensure_rendered_cursor_visible(content_height);
         }
         false
@@ -1395,9 +1420,11 @@ impl App {
             _ => {}
         }
         self.ensure_cursor_visible(content_height);
-        if self.show_preview {
+        if self.show_preview || self.show_outline {
             self.sync_render_from_rope();
             self.update_render_cursor_line();
+        }
+        if self.show_preview {
             self.ensure_rendered_cursor_visible(content_height);
         }
         false
@@ -1426,6 +1453,18 @@ impl App {
             self.sync_render_from_rope();
         }
         false
+    }
+
+    fn adjust_preview_ratio(&mut self, delta: i16) {
+        let mut ratio = self.preview_ratio as i16 + delta;
+        ratio = ratio.clamp(20, 80);
+        let ratio = ratio as u16;
+        if ratio == self.preview_ratio {
+            return;
+        }
+        self.preview_ratio = ratio;
+        self.config.preview_ratio = ratio;
+        let _ = config::write_config(&self.config);
     }
 
     fn insert_char(&mut self, c: char) {
@@ -1592,7 +1631,9 @@ impl App {
     fn ensure_rendered_cursor_visible(&mut self, height: u16) {
         let line = if let Some(line) = self.render_cursor_line {
             line
-        } else if let Some((line, _)) = self.compute_rendered_cursor_line_col(self.scroll) {
+        } else if let Some((line, _)) =
+            self.compute_rendered_cursor_line_col(self.approximate_rendered_line())
+        {
             self.render_cursor_line = Some(line);
             line
         } else {
@@ -1626,10 +1667,23 @@ impl App {
         if self.rendered.plain_lines.is_empty() {
             return;
         }
-        let anchor = self.render_cursor_line.unwrap_or(self.scroll);
+        let anchor = self
+            .render_cursor_line
+            .unwrap_or_else(|| self.approximate_rendered_line());
         if let Some((line, _)) = self.compute_rendered_cursor_line_col(anchor) {
             self.render_cursor_line = Some(line);
         }
+    }
+
+    fn approximate_rendered_line(&self) -> usize {
+        if self.rendered.plain_lines.is_empty() {
+            return 0;
+        }
+        let src_total = self.rope.len_lines().max(1);
+        let src_line = self.rope.char_to_line(self.cursor_char).min(src_total - 1);
+        let ratio = src_line as f32 / src_total as f32;
+        let target = (ratio * self.rendered.plain_lines.len() as f32).round() as usize;
+        target.min(self.rendered.plain_lines.len().saturating_sub(1))
     }
 
     fn update_search_matches(&mut self) {
@@ -1673,7 +1727,6 @@ impl App {
                     self.search_matches.push(RawMatch {
                         line: line_idx,
                         start: start_char,
-                        end: end_char,
                     });
                     self.search_match_map
                         .entry(line_idx)
@@ -1701,8 +1754,10 @@ impl App {
             self.cursor_char = line_start + m.start;
             self.preferred_col = None;
             self.ensure_cursor_visible(self.last_height.max(1));
-            if self.show_preview {
+            if self.show_preview || self.show_outline {
                 self.update_render_cursor_line();
+            }
+            if self.show_preview {
                 self.ensure_rendered_cursor_visible(self.last_height.max(1));
             }
         }
@@ -1740,7 +1795,7 @@ impl App {
             return Some((line, col));
         }
 
-        let fallback = src_line.min(self.rendered.plain_lines.len().saturating_sub(1));
+        let fallback = self.approximate_rendered_line();
         let line_len = self
             .rendered
             .plain_lines
@@ -1764,13 +1819,10 @@ impl App {
         }
         let anchor = anchor.min(total - 1);
         let window = 200usize;
-        let ranges = [
-            (
-                anchor.saturating_sub(window),
-                (anchor + window + 1).min(total),
-            ),
-            (0, total),
-        ];
+        let ranges = [(
+            anchor.saturating_sub(window),
+            (anchor + window + 1).min(total),
+        )];
 
         let mut best: Option<(usize, i64, Option<usize>)> = None;
         for (start, end) in ranges {
@@ -2344,22 +2396,6 @@ impl App {
         self.dirty = false;
     }
 
-    fn exit_edit_mode(&mut self) {
-        self.mode = Mode::Normal;
-        self.visual_anchor = None;
-        self.insert_record = None;
-        self.pending_change_lines = None;
-        self.clear_pending();
-        self.source = self.rope.to_string();
-        self.reparse_with_theme(false);
-        self.render_dirty = false;
-        self.scroll = self.edit_scroll;
-        self.status = if self.dirty {
-            Some("Modified".to_string())
-        } else {
-            Some("View".to_string())
-        };
-    }
 }
 
 fn current_heading_index(scroll: usize, headings: &[Heading]) -> usize {
@@ -2415,7 +2451,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
             })
             .collect();
         let mut state = ListState::default();
-        let selected = current_heading_index(app.scroll, &app.rendered.headings);
+        let outline_anchor = app.render_cursor_line.unwrap_or(app.scroll);
+        let selected = current_heading_index(outline_anchor, &app.rendered.headings);
         state.select(Some(selected));
         let list = List::new(items)
             .block(
@@ -2489,6 +2526,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
             Line::from("  n/N: next/prev match"),
             Line::from("  [/]: prev/next heading"),
             Line::from("  Shift+B: toggle preview pane"),
+            Line::from("  Alt+Left/Right: resize preview"),
             Line::from("  H: toggle outline"),
             Line::from("  t: theme picker"),
             Line::from("  :w/:q/:wq: save/quit"),
@@ -2582,7 +2620,6 @@ impl App {
             Mode::Normal => "normal",
             Mode::SearchInput => "search",
             Mode::ThemePicker => "themes",
-            Mode::Normal => "normal",
             Mode::Insert => "insert",
             Mode::VisualChar => "visual",
             Mode::VisualLine => "visual-line",
@@ -2831,15 +2868,34 @@ fn styles_from_palette(ui: UiPalette) -> (Style, MarkdownStyles) {
         .fg(ui.base_fg)
         .bg(bg_or_reset(ui.base_bg));
 
-    let heading = Style::default()
-        .fg(ui.accent)
-        .add_modifier(Modifier::BOLD);
-    let inline_code_bg = ui.code_bg.or_else(|| adjust_bg(ui.base_bg, -0.08));
+    let heading = [
+        Style::default()
+            .fg(ui.accent)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        Style::default().fg(ui.accent).add_modifier(Modifier::BOLD),
+        Style::default().fg(ui.accent).add_modifier(Modifier::ITALIC),
+        Style::default().fg(ui.muted).add_modifier(Modifier::BOLD),
+        Style::default().fg(ui.muted),
+        Style::default().fg(ui.muted).add_modifier(Modifier::ITALIC),
+    ];
+
+    let code_bg = adjusted_code_bg(ui.base_bg)
+        .or(ui.code_bg)
+        .or(ui.base_bg)
+        .or_else(|| fallback_code_bg(ui.base_fg));
+    let inline_code_bg = code_bg;
     let inline_code = Style::default()
         .fg(ui.accent)
-        .bg(bg_or_reset(inline_code_bg.or(ui.base_bg)));
+        .bg(bg_or_reset(inline_code_bg));
     let prefix = Style::default().fg(ui.muted);
     let rule = Style::default().fg(ui.muted);
+    let code_border = Style::default().fg(ui.border).bg(bg_or_reset(code_bg));
+    let code_header = Style::default()
+        .fg(ui.accent)
+        .bg(bg_or_reset(code_bg))
+        .add_modifier(Modifier::BOLD);
+    let table_border = Style::default().fg(ui.border);
+    let table_header = Style::default().fg(ui.accent).add_modifier(Modifier::BOLD);
 
     (
         base_style,
@@ -2850,7 +2906,11 @@ fn styles_from_palette(ui: UiPalette) -> (Style, MarkdownStyles) {
             inline_code,
             prefix,
             rule,
-            code_bg: inline_code_bg.or(ui.base_bg),
+            code_bg,
+            code_border,
+            code_header,
+            table_border,
+            table_header,
         },
     )
 }
@@ -2998,6 +3058,35 @@ fn adjust_bg(color: Option<Color>, delta: f32) -> Option<Color> {
             Some(Color::Rgb(dr, dg, db))
         }
         _ => None,
+    }
+}
+
+fn adjusted_code_bg(color: Option<Color>) -> Option<Color> {
+    let Some(Color::Rgb(r, g, b)) = color else {
+        return None;
+    };
+    let luminance = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
+    let delta = if luminance < 0.5 { 0.07 } else { -0.07 };
+    adjust_bg(Some(Color::Rgb(r, g, b)), delta)
+}
+
+fn fallback_code_bg(fg: Color) -> Option<Color> {
+    let Color::Rgb(r, g, b) = fg else {
+        return None;
+    };
+    let luminance = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
+    if luminance > 0.5 {
+        Some(Color::Rgb(
+            (r as f32 * 0.2) as u8,
+            (g as f32 * 0.2) as u8,
+            (b as f32 * 0.2) as u8,
+        ))
+    } else {
+        Some(Color::Rgb(
+            (r as f32 + (255 - r) as f32 * 0.75) as u8,
+            (g as f32 + (255 - g) as f32 * 0.75) as u8,
+            (b as f32 + (255 - b) as f32 * 0.75) as u8,
+        ))
     }
 }
 
