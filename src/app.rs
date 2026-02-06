@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Stdout};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
@@ -29,7 +30,13 @@ use syntect::parsing::SyntaxSet;
 use unicode_width::UnicodeWidthChar;
 use walkdir::WalkDir;
 
-pub fn run_app(path: PathBuf, mut config: Config) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppExit {
+    Quit,
+    Discover,
+}
+
+pub fn run_app(path: PathBuf, mut config: Config) -> Result<AppExit> {
     let theme_manager = ThemeManager::load(&config)?;
     if !theme_manager.theme_names().iter().any(|t| t == &config.theme) {
         config.theme = theme_manager.fallback_name().to_string();
@@ -52,6 +59,7 @@ pub fn run_app(path: PathBuf, mut config: Config) -> Result<()> {
     loop {
         let size = terminal.size()?;
         let layout = app.layout(size);
+        app.last_height = layout.editor_height;
         let render_width = layout.preview_width.unwrap_or(layout.editor_width);
         let render_height = layout.preview_height.unwrap_or(layout.editor_height);
         app.ensure_rendered(render_width);
@@ -81,7 +89,11 @@ pub fn run_app(path: PathBuf, mut config: Config) -> Result<()> {
         app.handle_pending_reload();
     }
 
-    Ok(())
+    if app.request_discover {
+        Ok(AppExit::Discover)
+    } else {
+        Ok(AppExit::Quit)
+    }
 }
 
 pub fn run_discover(config: &Config) -> Result<Option<PathBuf>> {
@@ -129,6 +141,7 @@ struct DiscoverState {
     status: Option<String>,
     query: String,
     filter_mode: bool,
+    show_help: bool,
 }
 
 impl DiscoverState {
@@ -144,10 +157,21 @@ impl DiscoverState {
             status: None,
             query: String::new(),
             filter_mode: false,
+            show_help: false,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Option<PathBuf>> {
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.show_help = false;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
         if self.filter_mode {
             match key.code {
                 KeyCode::Esc => {
@@ -226,6 +250,9 @@ impl DiscoverState {
                 if !self.filtered.is_empty() {
                     self.selected = self.filtered.len() - 1;
                 }
+            }
+            KeyCode::Char('?') => {
+                self.show_help = true;
             }
             KeyCode::Char('/') => {
                 self.filter_mode = true;
@@ -306,6 +333,33 @@ fn discover_ui(f: &mut ratatui::Frame, state: &mut DiscoverState, size: Rect) {
         .style(state.base_style)
         .scroll((state.scroll as u16, 0));
     f.render_widget(paragraph, main);
+
+    if state.show_help {
+        let popup = centered_rect(70, 60, main);
+        f.render_widget(Clear, popup);
+        let help_lines = vec![
+            Line::from(Span::styled("Discover Help", Style::default().fg(state.ui.accent).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from("j/k or arrows: move selection"),
+            Line::from("PageUp/PageDown: scroll"),
+            Line::from("Enter: open file"),
+            Line::from("q or Esc: quit"),
+            Line::from("/ : filter mode"),
+            Line::from("?: toggle help"),
+            Line::from(""),
+            Line::from("Filter mode: type to filter, Backspace delete, Ctrl+U clear, Enter/Esc exit"),
+        ];
+        let help = Paragraph::new(Text::from(help_lines))
+            .block(
+                Block::bordered()
+                    .title(" Help ")
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(state.ui.border))
+                    .style(state.base_style),
+            )
+            .style(state.base_style);
+        f.render_widget(help, popup);
+    }
 
     let status_text = state.status.clone().unwrap_or_else(|| {
         let filter_hint = if state.filter_mode {
@@ -454,7 +508,6 @@ enum Mode {
     Normal,
     SearchInput,
     ThemePicker,
-    Edit,
     Insert,
     VisualChar,
     VisualLine,
@@ -482,6 +535,12 @@ enum LastChange {
     Paste { text: String, linewise: bool },
     ReplaceChar(char),
     ChangeLines { insert: String, count: usize },
+}
+
+#[derive(Debug, Clone)]
+struct RawMatch {
+    line: usize,
+    start: usize,
 }
 
 struct LayoutInfo {
@@ -532,8 +591,12 @@ struct App {
     search_input: String,
     command_input: String,
     current_match: usize,
+    search_matches: Vec<RawMatch>,
+    search_match_map: HashMap<usize, Vec<Range<usize>>>,
+    search_dirty: bool,
     last_reload: SystemTime,
     last_width: u16,
+    last_height: u16,
     status: Option<String>,
     reload: FsReload,
     theme_selected: usize,
@@ -542,12 +605,14 @@ struct App {
     render_cursor_line: Option<usize>,
     editor_lines: Vec<Line<'static>>,
     editor_cache_dirty: bool,
+    show_help: bool,
+    request_discover: bool,
     rope: Rope,
 }
 
 impl App {
     fn new(path: PathBuf, config: Config, theme_manager: ThemeManager) -> Result<Self> {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let syntax_set = theme_manager.syntax_set().clone();
         let markdown = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
         let theme = theme_manager.get(&config.theme);
@@ -609,13 +674,17 @@ impl App {
             pending_change_lines: None,
             show_outline,
             show_preview: false,
-            mode: Mode::Edit,
+            mode: Mode::Normal,
             search_query: String::new(),
             search_input: String::new(),
             command_input: String::new(),
             current_match: 0,
+            search_matches: Vec::new(),
+            search_match_map: HashMap::new(),
+            search_dirty: false,
             last_reload: SystemTime::now(),
             last_width: 0,
+            last_height: 0,
             status: Some("NORMAL".to_string()),
             reload: FsReload::default(),
             theme_selected,
@@ -624,6 +693,8 @@ impl App {
             render_cursor_line: None,
             editor_lines: Vec::new(),
             editor_cache_dirty: true,
+            show_help: false,
+            request_discover: false,
             rope,
         })
     }
@@ -723,7 +794,7 @@ impl App {
             Mode::SearchInput => return self.handle_search_input(key),
             Mode::ThemePicker => return self.handle_theme_picker(key),
             Mode::CommandInput => return self.handle_command_input(key),
-            Mode::Normal | Mode::Edit | Mode::Insert | Mode::VisualChar | Mode::VisualLine => {
+            Mode::Normal | Mode::Insert | Mode::VisualChar | Mode::VisualLine => {
                 return self.handle_editor_input(key, content_height)
             }
         }
@@ -732,19 +803,21 @@ impl App {
     fn handle_search_input(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Edit;
+                self.mode = Mode::Normal;
                 self.search_input = String::new();
             }
             KeyCode::Enter => {
-                self.mode = Mode::Edit;
+                self.mode = Mode::Normal;
                 self.search_query = self.search_input.trim().to_string();
                 self.search_input.clear();
                 self.refresh_render(self.last_width.max(1));
-                if self.rendered.matches.is_empty() && !self.search_query.is_empty() {
+                self.search_dirty = true;
+                self.update_search_matches();
+                if self.search_matches.is_empty() && !self.search_query.is_empty() {
                     self.status = Some("No matches".to_string());
-                } else if !self.rendered.matches.is_empty() {
+                } else if !self.search_matches.is_empty() {
                     self.current_match = 0;
-                    self.scroll_to_match();
+                    self.jump_to_match(self.current_match);
                 }
             }
             KeyCode::Backspace => {
@@ -761,12 +834,12 @@ impl App {
     fn handle_theme_picker(&mut self, key: KeyEvent) -> bool {
         let total = self.theme_manager.theme_names().len();
         if total == 0 {
-            self.mode = Mode::Edit;
+            self.mode = Mode::Normal;
             return false;
         }
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Edit;
+                self.mode = Mode::Normal;
                 if let Some(original) = self.theme_before_picker.take() {
                     if self.config.theme != original {
                         self.config.theme = original;
@@ -802,7 +875,7 @@ impl App {
                     self.apply_theme_styles();
                     self.reparse_with_theme(true);
                 }
-                self.mode = Mode::Edit;
+                self.mode = Mode::Normal;
                 self.theme_before_picker = None;
             }
             _ => {}
@@ -830,10 +903,10 @@ impl App {
     }
 
     fn jump_match(&mut self, delta: isize) {
-        if self.rendered.matches.is_empty() {
+        if self.search_matches.is_empty() {
             return;
         }
-        let len = self.rendered.matches.len();
+        let len = self.search_matches.len();
         let idx = self.current_match as isize + delta;
         let next = if idx < 0 {
             len - 1
@@ -841,13 +914,7 @@ impl App {
             (idx as usize) % len
         };
         self.current_match = next;
-        self.scroll_to_match();
-    }
-
-    fn scroll_to_match(&mut self) {
-        if let Some(m) = self.rendered.matches.get(self.current_match) {
-            self.set_rendered_cursor_line(m.line);
-        }
+        self.jump_to_match(self.current_match);
     }
 
     fn request_reload(&mut self) {
@@ -921,6 +988,7 @@ impl App {
                 self.last_reload = SystemTime::now();
                 self.render_dirty = false;
                 self.render_cursor_line = None;
+                self.search_dirty = true;
                 self.status = Some("Reloaded".to_string());
                 if let Some(idx) = find_anchor(&anchor, &self.rendered.plain_lines, self.scroll) {
                     self.scroll = idx;
@@ -962,11 +1030,17 @@ impl App {
         self.base_style = base_style;
         self.markdown_styles = markdown_styles;
         self.editor_cache_dirty = true;
+        if !self.search_query.is_empty() {
+            self.search_dirty = true;
+        }
     }
 
     fn mark_render_dirty(&mut self) {
         self.render_dirty = true;
         self.editor_cache_dirty = true;
+        if !self.search_query.is_empty() {
+            self.search_dirty = true;
+        }
     }
 
     fn sync_render_from_rope(&mut self) {
@@ -995,7 +1069,7 @@ impl App {
 
     fn handle_editor_input(&mut self, key: KeyEvent, content_height: u16) -> bool {
         match self.mode {
-            Mode::Normal | Mode::Edit => self.handle_normal_mode(key, content_height),
+            Mode::Normal => self.handle_normal_mode(key, content_height),
             Mode::Insert => self.handle_insert_mode(key, content_height),
             Mode::VisualChar | Mode::VisualLine => self.handle_visual_mode(key, content_height),
             _ => false,
@@ -1003,6 +1077,16 @@ impl App {
     }
 
     fn handle_normal_mode(&mut self, key: KeyEvent, content_height: u16) -> bool {
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.show_help = false;
+                }
+                _ => {}
+            }
+            return false;
+        }
+        let mut handled_ctrl_move = false;
         if self.replace_pending {
             self.replace_pending = false;
             if let KeyCode::Char(c) = key.code {
@@ -1015,20 +1099,36 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('r') => {
+                    self.redo();
+                    return false;
+                }
                 KeyCode::Char('d') => {
                     let half = (content_height / 2).max(1) as isize;
                     let count = self.take_count() as isize;
                     self.move_cursor_page(half.saturating_mul(count.max(1)));
-                    return false;
+                    handled_ctrl_move = true;
                 }
                 KeyCode::Char('u') => {
                     let half = (content_height / 2).max(1) as isize;
                     let count = self.take_count() as isize;
                     self.move_cursor_page(-half.saturating_mul(count.max(1)));
-                    return false;
+                    handled_ctrl_move = true;
+                }
+                KeyCode::Char('p') => {
+                    self.request_discover = true;
+                    return true;
                 }
                 _ => {}
             }
+        }
+        if handled_ctrl_move {
+            self.ensure_cursor_visible(content_height);
+            if self.show_preview {
+                self.update_render_cursor_line();
+                self.ensure_rendered_cursor_visible(content_height);
+            }
+            return false;
         }
 
         if let KeyCode::Char(c) = key.code {
@@ -1193,6 +1293,9 @@ impl App {
                     .position(|name| name == &self.config.theme)
                     .unwrap_or(0);
             }
+            KeyCode::Char('?') => {
+                self.show_help = true;
+            }
             _ => {}
         }
 
@@ -1303,13 +1406,13 @@ impl App {
     fn handle_command_input(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Edit;
+                self.mode = Mode::Normal;
                 self.command_input.clear();
             }
             KeyCode::Enter => {
                 let command = self.command_input.trim().to_string();
                 self.command_input.clear();
-                self.execute_command(&command);
+                return self.execute_command(&command);
             }
             KeyCode::Backspace => {
                 self.command_input.pop();
@@ -1319,7 +1422,7 @@ impl App {
             }
             _ => {}
         }
-        if matches!(self.mode, Mode::Edit | Mode::Normal) {
+        if matches!(self.mode, Mode::Normal) {
             self.sync_render_from_rope();
         }
         false
@@ -1470,10 +1573,19 @@ impl App {
     fn ensure_cursor_visible(&mut self, height: u16) {
         let (line, _) = self.cursor_line_col();
         let height = height as usize;
-        if line < self.edit_scroll {
-            self.edit_scroll = line;
-        } else if line >= self.edit_scroll + height {
-            self.edit_scroll = line.saturating_sub(height.saturating_sub(1));
+        if height == 0 {
+            return;
+        }
+        let margin = cursor_margin(height);
+        let min_line = self.edit_scroll.saturating_add(margin);
+        let max_line = self
+            .edit_scroll
+            .saturating_add(height.saturating_sub(1).saturating_sub(margin));
+        if line < min_line {
+            self.edit_scroll = line.saturating_sub(margin);
+        } else if line > max_line {
+            let target = line.saturating_add(margin + 1);
+            self.edit_scroll = target.saturating_sub(height);
         }
     }
 
@@ -1487,10 +1599,19 @@ impl App {
             return;
         };
         let height = height as usize;
-        if line < self.scroll {
-            self.scroll = line;
-        } else if line >= self.scroll + height {
-            self.scroll = line.saturating_sub(height.saturating_sub(1));
+        if height == 0 {
+            return;
+        }
+        let margin = cursor_margin(height);
+        let min_line = self.scroll.saturating_add(margin);
+        let max_line = self
+            .scroll
+            .saturating_add(height.saturating_sub(1).saturating_sub(margin));
+        if line < min_line {
+            self.scroll = line.saturating_sub(margin);
+        } else if line > max_line {
+            let target = line.saturating_add(margin + 1);
+            self.scroll = target.saturating_sub(height);
         }
     }
 
@@ -1508,6 +1629,82 @@ impl App {
         let anchor = self.render_cursor_line.unwrap_or(self.scroll);
         if let Some((line, _)) = self.compute_rendered_cursor_line_col(anchor) {
             self.render_cursor_line = Some(line);
+        }
+    }
+
+    fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.search_match_map.clear();
+        let query = self.search_query.trim();
+        if query.is_empty() {
+            self.search_dirty = false;
+            self.current_match = 0;
+            self.editor_cache_dirty = true;
+            return;
+        }
+        let needle = if self.config.search_case_sensitive {
+            query.to_string()
+        } else {
+            query.to_ascii_lowercase()
+        };
+        for (line_idx, line) in self.rope.lines().enumerate() {
+            let mut text = line.to_string();
+            if text.ends_with('\n') {
+                text.pop();
+                if text.ends_with('\r') {
+                    text.pop();
+                }
+            }
+            if text.is_empty() || needle.is_empty() {
+                continue;
+            }
+            let hay = if self.config.search_case_sensitive {
+                text.clone()
+            } else {
+                text.to_ascii_lowercase()
+            };
+            let mut cursor = 0usize;
+            while cursor < hay.len() {
+                if let Some(found) = hay[cursor..].find(&needle) {
+                    let start_byte = cursor + found;
+                    let end_byte = start_byte + needle.len();
+                    let start_char = hay[..start_byte].chars().count();
+                    let end_char = hay[..end_byte].chars().count();
+                    self.search_matches.push(RawMatch {
+                        line: line_idx,
+                        start: start_char,
+                        end: end_char,
+                    });
+                    self.search_match_map
+                        .entry(line_idx)
+                        .or_default()
+                        .push(start_char..end_char);
+                    cursor = end_byte;
+                } else {
+                    break;
+                }
+            }
+        }
+        for ranges in self.search_match_map.values_mut() {
+            ranges.sort_by_key(|r| r.start);
+        }
+        self.search_dirty = false;
+        self.editor_cache_dirty = true;
+        if self.current_match >= self.search_matches.len() {
+            self.current_match = 0;
+        }
+    }
+
+    fn jump_to_match(&mut self, idx: usize) {
+        if let Some(m) = self.search_matches.get(idx) {
+            let line_start = self.rope.line_to_char(m.line);
+            self.cursor_char = line_start + m.start;
+            self.preferred_col = None;
+            self.ensure_cursor_visible(self.last_height.max(1));
+            if self.show_preview {
+                self.update_render_cursor_line();
+                self.ensure_rendered_cursor_visible(self.last_height.max(1));
+            }
         }
     }
 
@@ -1673,43 +1870,48 @@ impl App {
         self.status = Some("Saved".to_string());
     }
 
-    fn execute_command(&mut self, command: &str) {
+    fn execute_command(&mut self, command: &str) -> bool {
         let cmd = command.trim();
         if cmd.is_empty() {
-            self.mode = Mode::Edit;
-            return;
+            self.mode = Mode::Normal;
+            return false;
         }
 
         match cmd {
             "w" | "write" | "w!" => {
                 self.save_buffer();
-                self.mode = Mode::Edit;
+                self.mode = Mode::Normal;
             }
             "wq" | "x" => {
                 self.save_buffer();
                 if !self.dirty {
-                    self.exit_edit_mode();
+                    return true;
                 } else {
-                    self.mode = Mode::Edit;
+                    self.mode = Mode::Normal;
                 }
             }
             "q" | "quit" => {
                 if self.dirty {
                     self.status = Some("No write since last change (add ! to override)".to_string());
-                    self.mode = Mode::Edit;
+                    self.mode = Mode::Normal;
                 } else {
-                    self.exit_edit_mode();
+                    return true;
                 }
             }
             "q!" | "quit!" => {
                 self.discard_changes();
-                self.exit_edit_mode();
+                return true;
+            }
+            "discover" | "files" | "open" => {
+                self.request_discover = true;
+                return true;
             }
             _ => {
                 self.status = Some(format!("Not an editor command: {cmd}"));
-                self.mode = Mode::Edit;
+                self.mode = Mode::Normal;
             }
         }
+        false
     }
 
     fn clear_pending(&mut self) {
@@ -1763,6 +1965,7 @@ impl App {
         }
         self.mode = Mode::Insert;
         self.status = Some("INSERT".to_string());
+        self.show_help = false;
         self.clear_pending();
     }
 
@@ -1783,7 +1986,7 @@ impl App {
                 }
             }
         }
-        self.mode = Mode::Edit;
+        self.mode = Mode::Normal;
         self.status = Some("NORMAL".to_string());
         self.clear_pending();
     }
@@ -1792,6 +1995,7 @@ impl App {
         self.mode = Mode::VisualChar;
         self.visual_anchor = Some(self.cursor_char);
         self.status = Some("VISUAL".to_string());
+        self.show_help = false;
         self.clear_pending();
     }
 
@@ -1799,11 +2003,12 @@ impl App {
         self.mode = Mode::VisualLine;
         self.visual_anchor = Some(self.cursor_char);
         self.status = Some("VISUAL LINE".to_string());
+        self.show_help = false;
         self.clear_pending();
     }
 
     fn exit_visual_mode(&mut self) {
-        self.mode = Mode::Edit;
+        self.mode = Mode::Normal;
         self.visual_anchor = None;
         self.status = Some("NORMAL".to_string());
         self.clear_pending();
@@ -2267,6 +2472,44 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
         f.render_widget(preview_paragraph, preview_area);
     }
 
+    if app.show_help {
+        let popup = centered_rect(70, 70, layout.main);
+        f.render_widget(Clear, popup);
+        let help_lines = vec![
+            Line::from(Span::styled(
+                "mark help",
+                Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Normal mode"),
+            Line::from("  j/k or arrows: move cursor"),
+            Line::from("  h/l: move left/right"),
+            Line::from("  gg/G: top/bottom"),
+            Line::from("  /: search"),
+            Line::from("  n/N: next/prev match"),
+            Line::from("  [/]: prev/next heading"),
+            Line::from("  Shift+B: toggle preview pane"),
+            Line::from("  H: toggle outline"),
+            Line::from("  t: theme picker"),
+            Line::from("  :w/:q/:wq: save/quit"),
+            Line::from("  Ctrl+P or :open: discover files"),
+            Line::from("  i/a/o: insert"),
+            Line::from("  v/V: visual"),
+            Line::from("  ?: toggle help"),
+            Line::from("  q: quit (if clean)"),
+        ];
+        let help = Paragraph::new(Text::from(help_lines))
+            .block(
+                Block::bordered()
+                    .title(" Help ")
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(app.ui.border))
+                    .style(app.base_style),
+            )
+            .style(app.base_style);
+        f.render_widget(help, popup);
+    }
+
     if matches!(app.mode, Mode::ThemePicker) {
         let popup = centered_rect(60, 70, layout.main);
         f.render_widget(Clear, popup);
@@ -2339,7 +2582,7 @@ impl App {
             Mode::Normal => "normal",
             Mode::SearchInput => "search",
             Mode::ThemePicker => "themes",
-            Mode::Edit => "normal",
+            Mode::Normal => "normal",
             Mode::Insert => "insert",
             Mode::VisualChar => "visual",
             Mode::VisualLine => "visual-line",
@@ -2359,7 +2602,7 @@ impl App {
             Style::default().fg(self.ui.muted),
         ));
         if !self.search_query.is_empty() {
-            let total = self.rendered.matches.len();
+            let total = self.search_matches.len();
             let current = if total == 0 { 0 } else { self.current_match + 1 };
             parts.push(Span::styled(" | ", Style::default().fg(self.ui.muted)));
             parts.push(Span::styled(
@@ -2429,6 +2672,9 @@ impl App {
     }
 
     fn ensure_editor_cache(&mut self) {
+        if !self.search_query.is_empty() && self.search_dirty {
+            self.update_search_matches();
+        }
         if !self.editor_cache_dirty && !self.editor_lines.is_empty() {
             return;
         }
@@ -2450,7 +2696,8 @@ impl App {
         let mut code_fence = String::new();
         let mut code_highlighter: Option<HighlightLines> = None;
 
-        for line in self.rope.lines() {
+        let highlight = self.search_highlight_style();
+        for (line_idx, line) in self.rope.lines().enumerate() {
             let line_str = line.to_string();
             let trimmed = line_str.trim_start();
             let fence = if trimmed.starts_with("```") {
@@ -2470,38 +2717,37 @@ impl App {
                     in_code_block = true;
                     code_fence = marker.to_string();
                     let lang = trimmed[marker.len()..].trim();
-                    let syntax = if lang.is_empty() {
-                        self.syntax_set.find_syntax_plain_text()
-                    } else {
-                        self.syntax_set
-                            .find_syntax_by_token(lang)
-                            .or_else(|| self.syntax_set.find_syntax_by_extension(lang))
-                            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
-                    };
+                    let syntax = resolve_syntax_for_lang(&self.syntax_set, lang);
                     code_highlighter = Some(HighlightLines::new(syntax, theme));
                 }
 
-                let line_widget = highlight_line_with(
+                let mut spans = highlight_spans_with(
                     &mut highlighter,
                     &self.syntax_set,
                     &line_str,
                     self.ui.base_bg,
                     self.base_style,
                 );
-                lines.push(line_widget);
+                if let Some(ranges) = self.search_match_map.get(&line_idx) {
+                    spans = apply_match_highlight(spans, ranges, highlight);
+                }
+                lines.push(Line::from(spans));
                 continue;
             }
 
             if in_code_block {
                 if let Some(highlighter) = code_highlighter.as_mut() {
-                    let line_widget = highlight_line_with(
+                    let mut spans = highlight_spans_with(
                         highlighter,
                         &self.syntax_set,
                         &line_str,
                         self.ui.base_bg,
                         self.base_style,
                     );
-                    lines.push(line_widget);
+                    if let Some(ranges) = self.search_match_map.get(&line_idx) {
+                        spans = apply_match_highlight(spans, ranges, highlight);
+                    }
+                    lines.push(Line::from(spans));
                 } else {
                     lines.push(Line::from(Span::styled(
                         line_str.trim_end_matches('\n').to_string(),
@@ -2509,14 +2755,17 @@ impl App {
                     )));
                 }
             } else {
-                let line_widget = highlight_line_with(
+                let mut spans = highlight_spans_with(
                     &mut highlighter,
                     &self.syntax_set,
                     &line_str,
                     self.ui.base_bg,
                     self.base_style,
                 );
-                lines.push(line_widget);
+                if let Some(ranges) = self.search_match_map.get(&line_idx) {
+                    spans = apply_match_highlight(spans, ranges, highlight);
+                }
+                lines.push(Line::from(spans));
             }
         }
         if lines.is_empty() {
@@ -2528,6 +2777,11 @@ impl App {
     fn editor_text(&mut self) -> Text<'static> {
         self.ensure_editor_cache();
         Text::from(self.editor_lines.clone())
+    }
+
+    fn search_highlight_style(&self) -> Style {
+        let fg = self.ui.base_bg.unwrap_or(self.ui.base_fg);
+        Style::default().bg(self.ui.accent).fg(fg)
     }
 
     fn cursor_screen_position(&self, layout: &LayoutInfo) -> Option<(u16, u16)> {
@@ -2628,13 +2882,13 @@ fn syntect_to_ratatui_style(
     out
 }
 
-fn highlight_line_with(
+fn highlight_spans_with(
     highlighter: &mut HighlightLines,
     syntax_set: &SyntaxSet,
     line: &str,
     base_bg: Option<Color>,
     base_style: Style,
-) -> Line<'static> {
+) -> Vec<Span<'static>> {
     let ranges = match highlighter.highlight_line(line, syntax_set) {
         Ok(r) => r,
         Err(_) => vec![(syntect::highlighting::Style::default(), line)],
@@ -2653,7 +2907,82 @@ fn highlight_line_with(
     if spans.is_empty() {
         spans.push(Span::styled("", base_style));
     }
-    Line::from(spans)
+    spans
+}
+
+fn resolve_syntax_for_lang<'a>(syntax_set: &'a SyntaxSet, lang: &str) -> &'a syntect::parsing::SyntaxReference {
+    let trimmed = lang.trim();
+    if trimmed.is_empty() {
+        return syntax_set.find_syntax_plain_text();
+    }
+    let token = trimmed.strip_prefix("language-").unwrap_or(trimmed);
+    let candidates = language_candidates(token);
+    for cand in candidates {
+        if let Some(syntax) = syntax_set.find_syntax_by_token(&cand) {
+            return syntax;
+        }
+        if let Some(syntax) = syntax_set.find_syntax_by_extension(&cand) {
+            return syntax;
+        }
+    }
+    syntax_set.find_syntax_plain_text()
+}
+
+fn language_candidates(lang: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = lang.to_ascii_lowercase();
+    match lower.as_str() {
+        "elixir" | "ex" | "exs" => {
+            out.push("Elixir".to_string());
+            out.push("elixir".to_string());
+            out.push("ex".to_string());
+            out.push("exs".to_string());
+        }
+        _ => {}
+    }
+    out.push(lang.to_string());
+    out
+}
+
+fn apply_match_highlight(
+    spans: Vec<Span<'static>>,
+    ranges: &[Range<usize>],
+    highlight: Style,
+) -> Vec<Span<'static>> {
+    if ranges.is_empty() {
+        return spans;
+    }
+    let mut cells: Vec<(char, Style)> = Vec::new();
+    for span in spans {
+        let style = span.style;
+        for ch in span.content.as_ref().chars() {
+            cells.push((ch, style));
+        }
+    }
+    for range in ranges {
+        let end = range.end.min(cells.len());
+        for idx in range.start.min(cells.len())..end {
+            cells[idx].1 = highlight;
+        }
+    }
+    if cells.is_empty() {
+        return vec![Span::styled("", highlight)];
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut current_style = cells[0].1;
+    let mut current_text = String::new();
+    for (ch, style) in cells {
+        if style != current_style {
+            out.push(Span::styled(current_text.clone(), current_style));
+            current_text.clear();
+            current_style = style;
+        }
+        current_text.push(ch);
+    }
+    if !current_text.is_empty() {
+        out.push(Span::styled(current_text, current_style));
+    }
+    out
 }
 
 fn bg_or_reset(color: Option<Color>) -> Color {
@@ -2691,6 +3020,16 @@ fn line_len_chars(rope: &Rope, line: usize) -> usize {
         len = len.saturating_sub(1);
     }
     len
+}
+
+const CURSOR_MARGIN: usize = 3;
+
+fn cursor_margin(height: usize) -> usize {
+    if height <= 2 {
+        0
+    } else {
+        CURSOR_MARGIN.min(height.saturating_sub(1) / 2)
+    }
 }
 
 fn slice_chars(text: &str, start: usize, end: usize) -> String {

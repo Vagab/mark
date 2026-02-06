@@ -21,7 +21,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            theme: "base16-ocean.dark".to_string(),
+            theme: "Monokai Extended".to_string(),
             show_outline: true,
             outline_width: 28,
             wrap: true,

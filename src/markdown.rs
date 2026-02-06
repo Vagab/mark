@@ -549,11 +549,7 @@ fn render_code_block(
     code_bg: Option<Color>,
     raw_lines: &mut Vec<Line<'static>>,
 ) {
-    let syntax = block
-        .language
-        .as_deref()
-        .and_then(|lang| syntax_set.find_syntax_by_token(lang))
-        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let syntax = resolve_code_syntax(syntax_set, block.language.as_deref());
     let mut highlighter = HighlightLines::new(syntax, theme);
 
     let gutter_style = Style::default().bg(code_bg.unwrap_or(Color::Reset));
@@ -578,6 +574,42 @@ fn render_code_block(
         }
         raw_lines.push(Line::from(spans));
     }
+}
+
+fn resolve_code_syntax<'a>(
+    syntax_set: &'a SyntaxSet,
+    lang: Option<&str>,
+) -> &'a syntect::parsing::SyntaxReference {
+    let Some(lang) = lang.map(|l| l.trim()).filter(|l| !l.is_empty()) else {
+        return syntax_set.find_syntax_plain_text();
+    };
+    let token = lang.strip_prefix("language-").unwrap_or(lang);
+    let candidates = language_candidates(token);
+    for cand in candidates {
+        if let Some(syntax) = syntax_set.find_syntax_by_token(&cand) {
+            return syntax;
+        }
+        if let Some(syntax) = syntax_set.find_syntax_by_extension(&cand) {
+            return syntax;
+        }
+    }
+    syntax_set.find_syntax_plain_text()
+}
+
+fn language_candidates(lang: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = lang.to_ascii_lowercase();
+    match lower.as_str() {
+        "elixir" | "ex" | "exs" => {
+            out.push("Elixir".to_string());
+            out.push("elixir".to_string());
+            out.push("ex".to_string());
+            out.push("exs".to_string());
+        }
+        _ => {}
+    }
+    out.push(lang.to_string());
+    out
 }
 
 fn syntect_to_ratatui(style: syntect::highlighting::Style, code_bg: Option<Color>) -> Style {

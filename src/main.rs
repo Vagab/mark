@@ -72,12 +72,25 @@ fn main() -> Result<()> {
     }
 
     let cfg = config::load_config()?;
-    let file = match cli.file {
+    let mut file = match cli.file {
         Some(path) => path,
         None => match app::run_discover(&cfg)? {
             Some(path) => path,
             None => return Ok(()),
         },
     };
-    app::run_app(file, cfg)
+
+    loop {
+        match app::run_app(file, cfg.clone())? {
+            app::AppExit::Quit => break,
+            app::AppExit::Discover => {
+                if let Some(path) = app::run_discover(&cfg)? {
+                    file = path;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

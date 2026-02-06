@@ -3,10 +3,14 @@ use anyhow::{Context, Result};
 use ratatui::style::Color;
 use std::path::PathBuf;
 use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect_assets::assets::HighlightingAssets;
 
 pub struct ThemeManager {
-    theme_set: ThemeSet,
+    assets: HighlightingAssets,
+    extra: ThemeSet,
     theme_names: Vec<String>,
+    syntax_set: SyntaxSet,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -21,22 +25,32 @@ pub struct UiPalette {
 
 impl ThemeManager {
     pub fn load(config: &Config) -> Result<Self> {
-        let mut theme_set = ThemeSet::load_defaults();
+        let assets = HighlightingAssets::from_binary();
+        let syntax_set = assets
+            .get_syntax_set()
+            .context("Failed to load syntect syntax set")?
+            .clone();
+        let mut extra = ThemeSet::new();
 
         if let Some(dir) = resolve_bat_theme_dir(config) {
             if dir.exists() {
-                let extra = ThemeSet::load_from_folder(&dir)
+                extra
+                    .add_from_folder(&dir)
                     .with_context(|| format!("Failed to load themes from {}", dir.display()))?;
-                theme_set.themes.extend(extra.themes);
             }
         }
 
-        let mut theme_names: Vec<String> = theme_set.themes.keys().cloned().collect();
+        let mut theme_names: Vec<String> =
+            assets.themes().map(|name| name.to_string()).collect();
+        theme_names.extend(extra.themes.keys().cloned());
         theme_names.sort();
+        theme_names.dedup();
 
         Ok(Self {
-            theme_set,
+            assets,
+            extra,
             theme_names,
+            syntax_set,
         })
     }
 
@@ -45,10 +59,10 @@ impl ThemeManager {
     }
 
     pub fn get(&self, name: &str) -> &syntect::highlighting::Theme {
-        self.theme_set
-            .themes
-            .get(name)
-            .unwrap_or_else(|| self.fallback_theme())
+        if let Some(theme) = self.extra.themes.get(name) {
+            return theme;
+        }
+        self.assets.get_theme(name)
     }
 
     pub fn ui_palette(&self, name: &str) -> UiPalette {
@@ -57,18 +71,18 @@ impl ThemeManager {
     }
 
     pub fn fallback_name(&self) -> &str {
+        let default_name = HighlightingAssets::default_theme();
+        if self.theme_names.iter().any(|name| name == default_name) {
+            return default_name;
+        }
         self.theme_names
             .first()
             .map(|s| s.as_str())
-            .unwrap_or("base16-ocean.dark")
+            .unwrap_or(default_name)
     }
 
-    fn fallback_theme(&self) -> &syntect::highlighting::Theme {
-        let name = self.fallback_name();
-        self.theme_set
-            .themes
-            .get(name)
-            .unwrap_or_else(|| self.theme_set.themes.values().next().expect("themeset empty"))
+    pub fn syntax_set(&self) -> &SyntaxSet {
+        &self.syntax_set
     }
 }
 
