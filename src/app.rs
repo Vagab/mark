@@ -626,6 +626,7 @@ struct App {
     show_help: bool,
     request_discover: bool,
     preview_full: bool,
+    preview_was_open: bool,
     preview_ratio: u16,
     rope: Rope,
 }
@@ -723,6 +724,7 @@ impl App {
             show_help: false,
             request_discover: false,
             preview_full: false,
+            preview_was_open: false,
             preview_ratio,
             rope,
         })
@@ -822,6 +824,14 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, content_height: u16) -> bool {
+        if self.preview_full
+            && !matches!(
+                self.mode,
+                Mode::CommandInput | Mode::SearchInput | Mode::ThemePicker
+            )
+        {
+            return self.handle_preview_navigation(key, content_height);
+        }
         match self.mode {
             Mode::SearchInput => return self.handle_search_input(key),
             Mode::ThemePicker => return self.handle_theme_picker(key),
@@ -1148,8 +1158,13 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('b') => {
-                    self.preview_full = !self.preview_full;
                     if self.preview_full {
+                        self.preview_full = false;
+                        self.show_preview = self.preview_was_open;
+                        self.preview_was_open = false;
+                    } else {
+                        self.preview_was_open = self.show_preview;
+                        self.preview_full = true;
                         self.show_preview = true;
                     }
                     return false;
@@ -1179,11 +1194,13 @@ impl App {
         }
         if handled_ctrl_move {
             self.ensure_cursor_visible(content_height);
-            if self.show_preview || self.show_outline {
-                self.update_render_cursor_line();
-            }
-            if self.show_preview {
-                self.ensure_rendered_cursor_visible(content_height);
+            if !self.preview_full {
+                if self.show_preview || self.show_outline {
+                    self.update_render_cursor_line();
+                }
+                if self.show_preview {
+                    self.ensure_rendered_cursor_visible(content_height);
+                }
             }
             return false;
         }
@@ -1415,12 +1432,14 @@ impl App {
         }
 
         self.ensure_cursor_visible(content_height);
-        if self.show_preview || self.show_outline {
-            self.sync_render_from_rope();
-            self.update_render_cursor_line();
-        }
-        if self.show_preview {
-            self.ensure_rendered_cursor_visible(content_height);
+        if !self.preview_full {
+            if self.show_preview || self.show_outline {
+                self.sync_render_from_rope();
+                self.update_render_cursor_line();
+            }
+            if self.show_preview {
+                self.ensure_rendered_cursor_visible(content_height);
+            }
         }
         false
     }
@@ -1459,12 +1478,14 @@ impl App {
             _ => {}
         }
         self.ensure_cursor_visible(content_height);
-        if self.show_preview || self.show_outline {
-            self.sync_render_from_rope();
-            self.update_render_cursor_line();
-        }
-        if self.show_preview {
-            self.ensure_rendered_cursor_visible(content_height);
+        if !self.preview_full {
+            if self.show_preview || self.show_outline {
+                self.sync_render_from_rope();
+                self.update_render_cursor_line();
+            }
+            if self.show_preview {
+                self.ensure_rendered_cursor_visible(content_height);
+            }
         }
         false
     }
@@ -1508,8 +1529,13 @@ impl App {
                     return false;
                 }
                 KeyCode::Char('b') => {
-                    self.preview_full = !self.preview_full;
                     if self.preview_full {
+                        self.preview_full = false;
+                        self.show_preview = self.preview_was_open;
+                        self.preview_was_open = false;
+                    } else {
+                        self.preview_was_open = self.show_preview;
+                        self.preview_full = true;
                         self.show_preview = true;
                     }
                     return false;
@@ -1828,6 +1854,14 @@ impl App {
         if let Some((line, _)) = self.compute_rendered_cursor_line_col(anchor) {
             self.render_cursor_line = Some(line);
         }
+    }
+
+    fn render_cursor_from_scroll(&mut self) {
+        if self.rendered.plain_lines.is_empty() {
+            return;
+        }
+        let max = self.rendered.plain_lines.len().saturating_sub(1);
+        self.render_cursor_line = Some(self.scroll.min(max));
     }
 
     fn approximate_rendered_line(&self) -> usize {
@@ -3152,8 +3186,7 @@ fn styles_from_palette(ui: UiPalette) -> (Style, MarkdownStyles) {
         Style::default().fg(ui.muted).add_modifier(Modifier::ITALIC),
     ];
 
-    let code_bg = adjusted_code_bg(ui.base_bg)
-        .or(ui.code_bg)
+    let code_bg = tinted_code_bg(ui.code_bg.or(ui.base_bg), ui.base_fg)
         .or(ui.base_bg)
         .or_else(|| fallback_code_bg(ui.base_fg));
     let inline_code_bg = code_bg;
@@ -3334,31 +3367,38 @@ fn adjust_bg(color: Option<Color>, delta: f32) -> Option<Color> {
     }
 }
 
-fn adjusted_code_bg(color: Option<Color>) -> Option<Color> {
-    let Some(Color::Rgb(r, g, b)) = color else {
+fn tinted_code_bg(base: Option<Color>, tint: Color) -> Option<Color> {
+    let Some(Color::Rgb(r, g, b)) = base else {
         return None;
     };
-    adjust_bg(Some(Color::Rgb(r, g, b)), -0.12)
+    let tinted = tint_color(Color::Rgb(r, g, b), tint, 0.06);
+    adjust_bg(Some(tinted), -0.12)
 }
 
 fn fallback_code_bg(fg: Color) -> Option<Color> {
     let Color::Rgb(r, g, b) = fg else {
         return None;
     };
-    let luminance = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
-    if luminance > 0.5 {
-        Some(Color::Rgb(
-            (r as f32 * 0.2) as u8,
-            (g as f32 * 0.2) as u8,
-            (b as f32 * 0.2) as u8,
-        ))
-    } else {
-        Some(Color::Rgb(
-            (r as f32 + (255 - r) as f32 * 0.75) as u8,
-            (g as f32 + (255 - g) as f32 * 0.75) as u8,
-            (b as f32 + (255 - b) as f32 * 0.75) as u8,
-        ))
-    }
+    Some(Color::Rgb(
+        (r as f32 * 0.2) as u8,
+        (g as f32 * 0.2) as u8,
+        (b as f32 * 0.2) as u8,
+    ))
+}
+
+fn tint_color(base: Color, accent: Color, amount: f32) -> Color {
+    let Color::Rgb(r, g, b) = base else {
+        return base;
+    };
+    let Color::Rgb(ar, ag, ab) = accent else {
+        return base;
+    };
+    let mix = |base: u8, accent: u8| {
+        let base = base as f32;
+        let accent = accent as f32;
+        (base * (1.0 - amount) + accent * amount).round() as u8
+    };
+    Color::Rgb(mix(r, ar), mix(g, ag), mix(b, ab))
 }
 
 fn adjust_channel(value: u8, delta: f32) -> u8 {
