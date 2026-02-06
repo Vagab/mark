@@ -523,6 +523,7 @@ dependencies = [
  "syntect",
  "toml",
  "unicode-width 0.1.14",
+ "walkdir",
 ]
 
 [[package]]

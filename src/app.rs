@@ -16,16 +16,18 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::Terminal;
 use ropey::Rope;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::FontStyle;
 use syntect::parsing::SyntaxSet;
 use unicode_width::UnicodeWidthChar;
+use walkdir::WalkDir;
 
 pub fn run_app(path: PathBuf, mut config: Config) -> Result<()> {
     let theme_manager = ThemeManager::load(&config)?;
@@ -80,6 +82,346 @@ pub fn run_app(path: PathBuf, mut config: Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn run_discover(config: &Config) -> Result<Option<PathBuf>> {
+    let theme_manager = ThemeManager::load(config)?;
+    let ui = theme_manager.ui_palette(&config.theme);
+    let (base_style, _) = styles_from_palette(ui);
+
+    let files = collect_markdown_files(config);
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let mut state = DiscoverState::new(files, ui, base_style);
+    let mut terminal = setup_terminal()?;
+    let _guard = TerminalGuard;
+
+    let tick_rate = Duration::from_millis(50);
+    loop {
+        let size = terminal.size()?;
+        terminal.draw(|f| discover_ui(f, &mut state, size))?;
+
+        if event::poll(tick_rate)? {
+            if let Event::Key(key) = event::read()? {
+                if let Some(selected) = state.handle_key(key) {
+                    return Ok(selected);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiscoverItem {
+    path: PathBuf,
+    display: String,
+}
+
+struct DiscoverState {
+    items: Vec<DiscoverItem>,
+    filtered: Vec<usize>,
+    selected: usize,
+    scroll: usize,
+    ui: UiPalette,
+    base_style: Style,
+    status: Option<String>,
+    query: String,
+    filter_mode: bool,
+}
+
+impl DiscoverState {
+    fn new(items: Vec<DiscoverItem>, ui: UiPalette, base_style: Style) -> Self {
+        let filtered = (0..items.len()).collect::<Vec<_>>();
+        Self {
+            items,
+            filtered,
+            selected: 0,
+            scroll: 0,
+            ui,
+            base_style,
+            status: None,
+            query: String::new(),
+            filter_mode: false,
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Option<PathBuf>> {
+        if self.filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.filter_mode = false;
+                    return None;
+                }
+                KeyCode::Enter => {
+                    self.filter_mode = false;
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    self.query.pop();
+                    self.apply_filter();
+                    return None;
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.query.clear();
+                    self.apply_filter();
+                    return None;
+                }
+                KeyCode::Up => {
+                    self.selected = self.selected.saturating_sub(1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    if self.selected + 1 < self.filtered.len() {
+                        self.selected += 1;
+                    }
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    if !self.filtered.is_empty() {
+                        self.selected =
+                            (self.selected + 10).min(self.filtered.len().saturating_sub(1));
+                    }
+                    return None;
+                }
+                KeyCode::PageUp => {
+                    self.selected = self.selected.saturating_sub(10);
+                    return None;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.query.push(c);
+                    self.apply_filter();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Some(None),
+            KeyCode::Enter => {
+                let idx = *self.filtered.get(self.selected)?;
+                let path = self.items.get(idx).map(|i| i.path.clone());
+                return Some(path);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.selected + 1 < self.filtered.len() {
+                    self.selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                if !self.filtered.is_empty() {
+                    self.selected = (self.selected + 10).min(self.filtered.len().saturating_sub(1));
+                }
+            }
+            KeyCode::PageUp => {
+                self.selected = self.selected.saturating_sub(10);
+            }
+            KeyCode::Char('g') => self.selected = 0,
+            KeyCode::Char('G') => {
+                if !self.filtered.is_empty() {
+                    self.selected = self.filtered.len() - 1;
+                }
+            }
+            KeyCode::Char('/') => {
+                self.filter_mode = true;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn apply_filter(&mut self) {
+        let query = self.query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            self.filtered = (0..self.items.len()).collect();
+        } else {
+            self.filtered = self
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    if item.display.to_ascii_lowercase().contains(&query) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            self.scroll = 0;
+        } else if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len() - 1;
+        }
+    }
+}
+
+fn discover_ui(f: &mut ratatui::Frame, state: &mut DiscoverState, size: Rect) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(size);
+    let main = vertical[0];
+    let status = vertical[1];
+
+    let content_height = main.height.saturating_sub(2).max(1) as usize;
+    if state.selected < state.scroll {
+        state.scroll = state.selected;
+    } else if state.selected >= state.scroll + content_height {
+        state.scroll = state.selected.saturating_sub(content_height.saturating_sub(1));
+    }
+
+    let highlight_fg = state.ui.base_bg.unwrap_or(state.ui.base_fg);
+    let highlight = Style::default().bg(state.ui.accent).fg(highlight_fg);
+
+    let lines: Vec<Line> = state
+        .filtered
+        .iter()
+        .enumerate()
+        .map(|(idx, item_idx)| {
+            let item = &state.items[*item_idx];
+            let style = if idx == state.selected {
+                highlight
+            } else {
+                state.base_style
+            };
+            Line::from(Span::styled(item.display.clone(), style))
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(
+            Block::bordered()
+                .title(" Discover ")
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(state.ui.border))
+                .style(state.base_style),
+        )
+        .style(state.base_style)
+        .scroll((state.scroll as u16, 0));
+    f.render_widget(paragraph, main);
+
+    let status_text = state.status.clone().unwrap_or_else(|| {
+        let filter_hint = if state.filter_mode {
+            "filter: ".to_string() + &state.query
+        } else if state.query.is_empty() {
+            "/ filter".to_string()
+        } else {
+            format!("filter: {}", state.query)
+        };
+        format!(
+            "{} files | {} matches | {} | j/k move | Enter open | q quit",
+            state.items.len(),
+            state.filtered.len(),
+            filter_hint
+        )
+    });
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("mark", Style::default().fg(state.ui.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" | ", Style::default().fg(state.ui.muted)),
+            Span::styled(status_text, state.base_style),
+        ]))
+        .style(state.base_style)
+        .block(Block::default().style(state.base_style)),
+        status,
+    );
+}
+
+fn collect_markdown_files(config: &Config) -> Vec<DiscoverItem> {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = dirs::home_dir();
+    let mut roots = Vec::new();
+    roots.push(cwd.clone());
+    for path in &config.forced_discover_dirs {
+        roots.push(expand_discover_dir(path, &cwd, home.as_deref()));
+    }
+
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(&root).follow_links(false) {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if !is_markdown_file(path) {
+                continue;
+            }
+            let path = path.to_path_buf();
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let display = display_path(&path, &cwd, home.as_deref());
+            items.push(DiscoverItem { path, display });
+        }
+    }
+    items.sort_by(|a, b| a.display.cmp(&b.display));
+    items
+}
+
+fn is_markdown_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "md" | "markdown" | "mdx"
+    )
+}
+
+fn expand_discover_dir(path: &Path, cwd: &Path, home: Option<&Path>) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        if let Some(home) = home {
+            return home.to_path_buf();
+        }
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn display_path(path: &Path, cwd: &Path, home: Option<&Path>) -> String {
+    if let Ok(rel) = path.strip_prefix(cwd) {
+        let rel_str = rel.display().to_string();
+        return if rel_str.is_empty() {
+            "./".to_string()
+        } else {
+            format!("./{rel_str}")
+        };
+    }
+    if let Some(home) = home {
+        if let Ok(rel) = path.strip_prefix(home) {
+            let rel_str = rel.display().to_string();
+            return if rel_str.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{rel_str}")
+            };
+        }
+    }
+    path.display().to_string()
 }
 
 struct TerminalGuard;

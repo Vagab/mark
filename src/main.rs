@@ -71,10 +71,13 @@ fn main() -> Result<()> {
         }
     }
 
-    let file = cli
-        .file
-        .ok_or_else(|| anyhow::anyhow!("No file provided. Try `mark <file.md>`."))?;
-
     let cfg = config::load_config()?;
+    let file = match cli.file {
+        Some(path) => path,
+        None => match app::run_discover(&cfg)? {
+            Some(path) => path,
+            None => return Ok(()),
+        },
+    };
     app::run_app(file, cfg)
 }

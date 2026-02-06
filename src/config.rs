@@ -15,6 +15,7 @@ pub struct Config {
     pub search_case_sensitive: bool,
     pub bat_theme_dir: Option<PathBuf>,
     pub tab_width: usize,
+    pub forced_discover_dirs: Vec<PathBuf>,
 }
 
 impl Default for Config {
@@ -27,6 +28,7 @@ impl Default for Config {
             search_case_sensitive: false,
             bat_theme_dir: dirs::config_dir().map(|dir| dir.join("bat").join("themes")),
             tab_width: 4,
+            forced_discover_dirs: default_forced_discover_dirs(),
         }
     }
 }
@@ -40,6 +42,7 @@ struct PartialConfig {
     search_case_sensitive: Option<bool>,
     bat_theme_dir: Option<PathBuf>,
     tab_width: Option<usize>,
+    forced_discover_dirs: Option<Vec<PathBuf>>,
 }
 
 impl PartialConfig {
@@ -96,6 +99,13 @@ impl PartialConfig {
                 defaults.tab_width
             }
         };
+        let forced_discover_dirs = match self.forced_discover_dirs {
+            Some(v) => v,
+            None => {
+                changed = true;
+                defaults.forced_discover_dirs
+            }
+        };
 
         (
             Config {
@@ -106,10 +116,20 @@ impl PartialConfig {
                 search_case_sensitive,
                 bat_theme_dir,
                 tab_width,
+                forced_discover_dirs,
             },
             changed,
         )
     }
+}
+
+fn default_forced_discover_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".claude"));
+    }
+    dirs.push(PathBuf::from("./.claude"));
+    dirs
 }
 
 pub fn config_path() -> Result<PathBuf> {
