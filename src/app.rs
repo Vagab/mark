@@ -60,15 +60,18 @@ pub fn run_app(path: PathBuf, mut config: Config) -> Result<AppExit> {
         let size = terminal.size()?;
         let layout = app.layout(size);
         app.last_height = layout.editor_height;
+        app.last_editor_width = layout.editor_width;
         let render_width = layout.preview_width.unwrap_or(layout.editor_width);
         let render_height = layout.preview_height.unwrap_or(layout.editor_height);
         app.ensure_rendered(render_width);
         app.sync_render_from_rope();
         app.clamp_scroll(render_height);
-        if app.show_preview || app.show_outline {
+        if app.preview_full {
+            app.render_cursor_from_scroll();
+        } else if app.show_preview || app.show_outline {
             app.update_render_cursor_line();
         }
-        if app.show_preview {
+        if app.show_preview && !app.preview_full {
             app.ensure_rendered_cursor_visible(render_height);
         }
 
@@ -545,6 +548,13 @@ struct RawMatch {
     start: usize,
 }
 
+#[derive(Debug, Clone)]
+struct WrappedSegment {
+    line_idx: usize,
+    col_start: usize,
+    col_end: usize,
+}
+
 struct LayoutInfo {
     main: Rect,
     status: Rect,
@@ -607,8 +617,15 @@ struct App {
     render_cursor_line: Option<usize>,
     editor_lines: Vec<Line<'static>>,
     editor_cache_dirty: bool,
+    editor_wrap_lines: Vec<Line<'static>>,
+    editor_wrap_map: Vec<usize>,
+    editor_wrap_segments: Vec<WrappedSegment>,
+    editor_wrap_dirty: bool,
+    editor_wrap_width: u16,
+    last_editor_width: u16,
     show_help: bool,
     request_discover: bool,
+    preview_full: bool,
     preview_ratio: u16,
     rope: Rope,
 }
@@ -697,8 +714,15 @@ impl App {
             render_cursor_line: None,
             editor_lines: Vec::new(),
             editor_cache_dirty: true,
+            editor_wrap_lines: Vec::new(),
+            editor_wrap_map: Vec::new(),
+            editor_wrap_segments: Vec::new(),
+            editor_wrap_dirty: true,
+            editor_wrap_width: 0,
+            last_editor_width: 0,
             show_help: false,
             request_discover: false,
+            preview_full: false,
             preview_ratio,
             rope,
         })
@@ -726,7 +750,9 @@ impl App {
             (None, main)
         };
 
-        let (editor, preview) = if self.show_preview {
+        let (editor, preview) = if self.show_preview && self.preview_full {
+            (body, None)
+        } else if self.show_preview {
             let ratio = self.preview_ratio.clamp(20, 80);
             let split = Layout::default()
                 .direction(Direction::Horizontal)
@@ -1092,6 +1118,9 @@ impl App {
             }
             return false;
         }
+        if self.preview_full {
+            return self.handle_preview_navigation(key, content_height);
+        }
         let mut handled_ctrl_move = false;
         if self.replace_pending {
             self.replace_pending = false;
@@ -1118,6 +1147,13 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('b') => {
+                    self.preview_full = !self.preview_full;
+                    if self.preview_full {
+                        self.show_preview = true;
+                    }
+                    return false;
+                }
                 KeyCode::Char('r') => {
                     self.redo();
                     return false;
@@ -1286,6 +1322,9 @@ impl App {
             }
             KeyCode::Char('B') => {
                 self.show_preview = !self.show_preview;
+                if !self.show_preview {
+                    self.preview_full = false;
+                }
             }
             KeyCode::Char('H') => {
                 self.show_outline = !self.show_outline;
@@ -1455,6 +1494,105 @@ impl App {
         false
     }
 
+    fn handle_preview_navigation(&mut self, key: KeyEvent, content_height: u16) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    let half = (content_height / 2).max(1) as isize;
+                    self.preview_scroll_by(half, content_height);
+                    return false;
+                }
+                KeyCode::Char('u') => {
+                    let half = (content_height / 2).max(1) as isize;
+                    self.preview_scroll_by(-half, content_height);
+                    return false;
+                }
+                KeyCode::Char('b') => {
+                    self.preview_full = !self.preview_full;
+                    if self.preview_full {
+                        self.show_preview = true;
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.preview_scroll_by(1, content_height);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.preview_scroll_by(-1, content_height);
+            }
+            KeyCode::PageDown => self.preview_scroll_by(content_height as isize, content_height),
+            KeyCode::PageUp => self.preview_scroll_by(-(content_height as isize), content_height),
+            KeyCode::Char('[') => self.jump_heading_preview(-1, content_height),
+            KeyCode::Char(']') => self.jump_heading_preview(1, content_height),
+            KeyCode::Char('q') => {
+                if self.dirty {
+                    self.status =
+                        Some("No write since last change (use :q! to discard)".to_string());
+                } else {
+                    return true;
+                }
+            }
+            KeyCode::Char('B') => {
+                self.show_preview = !self.show_preview;
+                if !self.show_preview {
+                    self.preview_full = false;
+                }
+            }
+            KeyCode::Char('?') => {
+                self.show_help = true;
+            }
+            KeyCode::Char(':') => {
+                self.mode = Mode::CommandInput;
+                self.command_input.clear();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn preview_scroll_by(&mut self, delta: isize, height: u16) {
+        let height = height as usize;
+        if self.rendered.lines.is_empty() {
+            return;
+        }
+        let max_scroll = self
+            .rendered
+            .lines
+            .len()
+            .saturating_sub(height.max(1));
+        let next = if delta.is_negative() {
+            self.scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            (self.scroll + delta as usize).min(max_scroll)
+        };
+        self.scroll = next;
+        self.render_cursor_line = Some(self.scroll);
+    }
+
+    fn jump_heading_preview(&mut self, delta: isize, height: u16) {
+        if self.rendered.headings.is_empty() {
+            return;
+        }
+        let anchor = self.render_cursor_line.unwrap_or(self.scroll);
+        let current = current_heading_index(anchor, &self.rendered.headings);
+        let next = match delta.cmp(&0) {
+            Ordering::Less => current.saturating_sub(1),
+            Ordering::Greater => (current + 1).min(self.rendered.headings.len() - 1),
+            Ordering::Equal => current,
+        };
+        if let Some(h) = self.rendered.headings.get(next) {
+            let height = height as usize;
+            self.render_cursor_line = Some(h.line);
+            let margin = cursor_margin(height);
+            self.scroll = h.line.saturating_sub(margin);
+        }
+    }
+
     fn adjust_preview_ratio(&mut self, delta: i16) {
         let mut ratio = self.preview_ratio as i16 + delta;
         ratio = ratio.clamp(20, 80);
@@ -1610,10 +1748,27 @@ impl App {
     }
 
     fn ensure_cursor_visible(&mut self, height: u16) {
-        let (line, _) = self.cursor_line_col();
+        self.ensure_editor_cache();
+        let (line, col) = self.cursor_line_col();
         let height = height as usize;
         if height == 0 {
             return;
+        }
+        self.ensure_editor_wrap(self.last_editor_width);
+        let line = if self.config.wrap {
+            self.visual_line_for(line, col)
+        } else {
+            line
+        };
+        let max_scroll = if self.config.wrap {
+            self.editor_wrap_lines
+                .len()
+                .saturating_sub(height.max(1))
+        } else {
+            self.rope.len_lines().saturating_sub(height.max(1))
+        };
+        if self.edit_scroll > max_scroll {
+            self.edit_scroll = max_scroll;
         }
         let margin = cursor_margin(height);
         let min_line = self.edit_scroll.saturating_add(margin);
@@ -1780,7 +1935,7 @@ impl App {
         let visible_col = normalize_prefix_for_col(&line_str, src_col);
         let anchor = anchor.min(self.rendered.plain_lines.len().saturating_sub(1));
         if normalized.trim().is_empty() {
-            return Some((anchor, 0));
+            return Some((self.approximate_rendered_line(), 0));
         }
 
         let candidates = build_match_candidates(&normalized, visible_col);
@@ -2478,24 +2633,34 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
         format!(" {file_name} ")
     };
 
-    let editor_text = if matches!(app.mode, Mode::VisualChar | Mode::VisualLine) {
-        app.edit_text()
-    } else {
-        app.editor_text()
-    };
-    let editor_paragraph = Paragraph::new(editor_text)
-        .block(
-            Block::bordered()
-                .title(title)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(app.ui.border))
-                .style(app.base_style),
-        )
-        .style(app.base_style)
-        .scroll((app.edit_scroll as u16, 0));
-    f.render_widget(editor_paragraph, layout.editor);
+    if !app.preview_full {
+    let editor_text = app.editor_text();
+        let editor_paragraph = Paragraph::new(editor_text)
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(app.ui.border))
+                    .style(app.base_style),
+            )
+            .style(app.base_style)
+            .scroll((app.edit_scroll as u16, 0));
+        f.render_widget(editor_paragraph, layout.editor);
+    }
 
-    if let Some(preview_area) = layout.preview {
+    if app.preview_full {
+        let preview_paragraph = Paragraph::new(Text::from(app.rendered.lines.clone()))
+            .block(
+                Block::bordered()
+                    .title(" Preview ")
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(app.ui.border))
+                    .style(app.base_style),
+            )
+            .style(app.base_style)
+            .scroll((app.scroll as u16, 0));
+        f.render_widget(preview_paragraph, layout.editor);
+    } else if let Some(preview_area) = layout.preview {
         let preview_paragraph = Paragraph::new(Text::from(app.rendered.lines.clone()))
             .block(
                 Block::bordered()
@@ -2526,6 +2691,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
             Line::from("  n/N: next/prev match"),
             Line::from("  [/]: prev/next heading"),
             Line::from("  Shift+B: toggle preview pane"),
+            Line::from("  Ctrl+B: preview full screen"),
             Line::from("  Alt+Left/Right: resize preview"),
             Line::from("  H: toggle outline"),
             Line::from("  t: theme picker"),
@@ -2572,8 +2738,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
         f.render_stateful_widget(list, popup, &mut state);
     }
 
-    if let Some((x, y)) = app.cursor_screen_position(layout) {
-        f.set_cursor(x, y);
+    if !app.preview_full {
+        if let Some((x, y)) = app.cursor_screen_position(layout) {
+            f.set_cursor(x, y);
+        }
     }
 }
 
@@ -2654,60 +2822,6 @@ impl App {
         Line::from(parts)
     }
 
-    fn edit_text(&self) -> Text<'static> {
-        let selection = self.selection_range();
-        let selected_style = self.base_style.add_modifier(Modifier::REVERSED);
-        let mut lines = Vec::new();
-        let mut char_index = 0usize;
-        for line in self.rope.lines() {
-            let mut s = line.to_string();
-            if s.ends_with('\n') {
-                s.pop();
-                if s.ends_with('\r') {
-                    s.pop();
-                }
-            }
-            let line_visible_len = s.chars().count();
-            let mut spans = Vec::new();
-            if let Some((sel_start, sel_end, _)) = selection {
-                let line_start = char_index;
-                let line_end = line_start + line_visible_len;
-                if sel_end <= line_start || sel_start >= line_end {
-                    spans.push(Span::styled(s, self.base_style));
-                } else {
-                    let before_end = sel_start.saturating_sub(line_start).min(line_visible_len);
-                    let after_start = sel_end.saturating_sub(line_start).min(line_visible_len);
-                    if before_end > 0 {
-                        spans.push(Span::styled(
-                            slice_chars(&s, 0, before_end),
-                            self.base_style,
-                        ));
-                    }
-                    if after_start > before_end {
-                        spans.push(Span::styled(
-                            slice_chars(&s, before_end, after_start),
-                            selected_style,
-                        ));
-                    }
-                    if after_start < line_visible_len {
-                        spans.push(Span::styled(
-                            slice_chars(&s, after_start, line_visible_len),
-                            self.base_style,
-                        ));
-                    }
-                }
-            } else {
-                spans.push(Span::styled(s, self.base_style));
-            }
-            lines.push(Line::from(spans));
-            char_index = char_index.saturating_add(line.len_chars());
-        }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled("", self.base_style)));
-        }
-        Text::from(lines)
-    }
-
     fn ensure_editor_cache(&mut self) {
         if !self.search_query.is_empty() && self.search_dirty {
             self.update_search_matches();
@@ -2717,6 +2831,39 @@ impl App {
         }
         self.editor_lines = self.build_editor_cache();
         self.editor_cache_dirty = false;
+        self.editor_wrap_dirty = true;
+    }
+
+    fn ensure_editor_wrap(&mut self, width: u16) {
+        if width == 0 {
+            return;
+        }
+        if !self.config.wrap {
+            self.editor_wrap_lines = self.editor_lines.clone();
+            self.editor_wrap_map = (0..self.editor_wrap_lines.len()).collect();
+            self.editor_wrap_segments = self
+                .editor_wrap_lines
+                .iter()
+                .enumerate()
+                .map(|(idx, line)| WrappedSegment {
+                    line_idx: idx,
+                    col_start: 0,
+                    col_end: line_chars_len(line),
+                })
+                .collect();
+            self.editor_wrap_width = width;
+            self.editor_wrap_dirty = false;
+            return;
+        }
+        if !self.editor_wrap_dirty && self.editor_wrap_width == width {
+            return;
+        }
+        let (lines, map, segments) = wrap_editor_lines(&self.editor_lines, width as usize);
+        self.editor_wrap_lines = lines;
+        self.editor_wrap_map = map;
+        self.editor_wrap_segments = segments;
+        self.editor_wrap_width = width;
+        self.editor_wrap_dirty = false;
     }
 
     fn build_editor_cache(&self) -> Vec<Line<'static>> {
@@ -2813,7 +2960,123 @@ impl App {
 
     fn editor_text(&mut self) -> Text<'static> {
         self.ensure_editor_cache();
-        Text::from(self.editor_lines.clone())
+        self.ensure_editor_wrap(self.last_editor_width.max(1));
+        let mut lines = if self.config.wrap {
+            self.editor_wrap_lines.clone()
+        } else {
+            self.editor_lines.clone()
+        };
+        if matches!(self.mode, Mode::VisualChar | Mode::VisualLine) {
+            lines = self.apply_selection_overlay(lines);
+        }
+        Text::from(lines)
+    }
+
+    fn apply_selection_overlay(&self, lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+        let Some(map) = self.selection_line_ranges() else {
+            return lines;
+        };
+        let highlight = self.base_style.add_modifier(Modifier::REVERSED);
+        if !self.config.wrap {
+            return lines
+                .into_iter()
+                .enumerate()
+                .map(|(idx, line)| {
+                    if let Some(range) = map.get(&idx) {
+                        let spans = apply_match_highlight(line.spans.clone(), std::slice::from_ref(range), highlight);
+                        Line::from(spans)
+                    } else {
+                        line
+                    }
+                })
+                .collect();
+        }
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                let Some(segment) = self.editor_wrap_segments.get(idx) else {
+                    return line;
+                };
+                let Some(range) = map.get(&segment.line_idx) else {
+                    return line;
+                };
+                let start = range.start.max(segment.col_start);
+                let end = range.end.min(segment.col_end);
+                if start >= end {
+                    return line;
+                }
+                let local = (start - segment.col_start)..(end - segment.col_start);
+                let spans = apply_match_highlight(line.spans.clone(), std::slice::from_ref(&local), highlight);
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    fn selection_line_ranges(&self) -> Option<HashMap<usize, Range<usize>>> {
+        let (sel_start, sel_end, _) = self.selection_range()?;
+        let mut map: HashMap<usize, Range<usize>> = HashMap::new();
+        let mut char_index = 0usize;
+        for (line_idx, line) in self.rope.lines().enumerate() {
+            let mut s = line.to_string();
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            let line_len = s.chars().count();
+            let line_start = char_index;
+            let line_end = line_start + line_len;
+            if sel_end <= line_start {
+                break;
+            }
+            if sel_start < line_end && sel_end > line_start {
+                let start_col = sel_start.saturating_sub(line_start).min(line_len);
+                let end_col = sel_end.saturating_sub(line_start).min(line_len);
+                if start_col != end_col {
+                    map.insert(line_idx, start_col..end_col);
+                }
+            }
+            char_index = char_index.saturating_add(line.len_chars());
+        }
+        Some(map)
+    }
+
+    fn visual_line_for(&self, line: usize, col: usize) -> usize {
+        let Some(&start_idx) = self.editor_wrap_map.get(line) else {
+            return line;
+        };
+        let mut idx = start_idx;
+        let mut last_idx = start_idx;
+        while let Some(seg) = self.editor_wrap_segments.get(idx) {
+            if seg.line_idx != line {
+                break;
+            }
+            last_idx = idx;
+            if col < seg.col_end {
+                return idx;
+            }
+            idx += 1;
+        }
+        last_idx
+    }
+
+    fn visual_col_for(&self, line: usize, col: usize, line_str: &str) -> usize {
+        let Some(&start_idx) = self.editor_wrap_map.get(line) else {
+            return col;
+        };
+        let mut idx = start_idx;
+        while let Some(seg) = self.editor_wrap_segments.get(idx) {
+            if seg.line_idx != line {
+                break;
+            }
+            if col < seg.col_end {
+                return width_of_chars(line_str, seg.col_start, col);
+            }
+            idx += 1;
+        }
+        width_of_chars(line_str, 0, col)
     }
 
     fn search_highlight_style(&self) -> Style {
@@ -2830,10 +3093,15 @@ impl App {
 
     fn edit_cursor_screen_position(&self, layout: &LayoutInfo) -> Option<(u16, u16)> {
         let (line, col) = self.cursor_line_col();
-        if line < self.edit_scroll {
+        let visual_line = if self.config.wrap {
+            self.visual_line_for(line, col)
+        } else {
+            line
+        };
+        if visual_line < self.edit_scroll {
             return None;
         }
-        let visible_line = line - self.edit_scroll;
+        let visible_line = visual_line - self.edit_scroll;
         if visible_line >= layout.editor_height as usize {
             return None;
         }
@@ -2845,10 +3113,15 @@ impl App {
                 line_str.pop();
             }
         }
-        let mut width = 0usize;
-        for ch in line_str.chars().take(col) {
-            width += UnicodeWidthChar::width(ch).unwrap_or(0);
-        }
+        let width = if self.config.wrap {
+            self.visual_col_for(line, col, &line_str)
+        } else {
+            let mut w = 0usize;
+            for ch in line_str.chars().take(col) {
+                w += UnicodeWidthChar::width(ch).unwrap_or(0);
+            }
+            w
+        };
         let x = layout
             .editor
             .x
@@ -3065,9 +3338,7 @@ fn adjusted_code_bg(color: Option<Color>) -> Option<Color> {
     let Some(Color::Rgb(r, g, b)) = color else {
         return None;
     };
-    let luminance = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
-    let delta = if luminance < 0.5 { 0.07 } else { -0.07 };
-    adjust_bg(Some(Color::Rgb(r, g, b)), delta)
+    adjust_bg(Some(Color::Rgb(r, g, b)), -0.12)
 }
 
 fn fallback_code_bg(fg: Color) -> Option<Color> {
@@ -3109,6 +3380,128 @@ fn line_len_chars(rope: &Rope, line: usize) -> usize {
         len = len.saturating_sub(1);
     }
     len
+}
+
+fn width_of_chars(text: &str, start: usize, end: usize) -> usize {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+fn line_chars_len(line: &Line<'static>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref().chars().count())
+        .sum()
+}
+
+fn wrap_editor_lines(
+    lines: &[Line<'static>],
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<WrappedSegment>) {
+    let width = width.max(1);
+    let mut wrapped_lines = Vec::new();
+    let mut line_map = Vec::with_capacity(lines.len());
+    let mut segments = Vec::new();
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        line_map.push(wrapped_lines.len());
+        let (wrapped, segs) = wrap_editor_line(line, width, line_idx);
+        if wrapped.is_empty() {
+            wrapped_lines.push(Line::from(Span::styled("", Style::default())));
+            segments.push(WrappedSegment {
+                line_idx,
+                col_start: 0,
+                col_end: 0,
+            });
+        } else {
+            wrapped_lines.extend(wrapped);
+            segments.extend(segs);
+        }
+    }
+
+    (wrapped_lines, line_map, segments)
+}
+
+fn wrap_editor_line(
+    line: &Line<'static>,
+    width: usize,
+    line_idx: usize,
+) -> (Vec<Line<'static>>, Vec<WrappedSegment>) {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut segments: Vec<WrappedSegment> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+    let mut col_start = 0usize;
+    let mut col_end = 0usize;
+
+    let push_current = |current_spans: &mut Vec<Span<'static>>,
+                        out: &mut Vec<Line<'static>>,
+                        segments: &mut Vec<WrappedSegment>,
+                        line_idx: usize,
+                        col_start: usize,
+                        col_end: usize| {
+        out.push(Line::from(current_spans.drain(..).collect::<Vec<_>>()));
+        segments.push(WrappedSegment {
+            line_idx,
+            col_start,
+            col_end,
+        });
+    };
+
+    for span in &line.spans {
+        let style = span.style;
+        for ch in span.content.as_ref().chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width + ch_width > width && current_width > 0 {
+                push_current(
+                    &mut current_spans,
+                    &mut out,
+                    &mut segments,
+                    line_idx,
+                    col_start,
+                    col_end,
+                );
+                current_width = 0;
+                col_start = col_end;
+            }
+            if let Some(last) = current_spans.last_mut() {
+                if last.style == style {
+                    let mut content = last.content.to_string();
+                    content.push(ch);
+                    last.content = content.into();
+                } else {
+                    current_spans.push(Span::styled(ch.to_string(), style));
+                }
+            } else {
+                current_spans.push(Span::styled(ch.to_string(), style));
+            }
+            current_width = current_width.saturating_add(ch_width);
+            col_end = col_end.saturating_add(1);
+        }
+    }
+
+    if current_spans.is_empty() {
+        out.push(Line::from(Span::styled("", Style::default())));
+        segments.push(WrappedSegment {
+            line_idx,
+            col_start: 0,
+            col_end: 0,
+        });
+    } else {
+        push_current(
+            &mut current_spans,
+            &mut out,
+            &mut segments,
+            line_idx,
+            col_start,
+            col_end,
+        );
+    }
+
+    (out, segments)
 }
 
 const CURSOR_MARGIN: usize = 3;
