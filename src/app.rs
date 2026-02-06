@@ -3186,19 +3186,19 @@ fn styles_from_palette(ui: UiPalette) -> (Style, MarkdownStyles) {
         Style::default().fg(ui.muted).add_modifier(Modifier::ITALIC),
     ];
 
-    let code_bg = tinted_code_bg(ui.code_bg.or(ui.base_bg), ui.base_fg)
+    let inline_code_bg = tinted_code_bg(ui.code_bg.or(ui.base_bg), ui.base_fg)
         .or(ui.base_bg)
         .or_else(|| fallback_code_bg(ui.base_fg));
-    let inline_code_bg = code_bg;
+    let code_block_bg = ui.base_bg;
     let inline_code = Style::default()
         .fg(ui.accent)
         .bg(bg_or_reset(inline_code_bg));
     let prefix = Style::default().fg(ui.muted);
     let rule = Style::default().fg(ui.muted);
-    let code_border = Style::default().fg(ui.border).bg(bg_or_reset(code_bg));
+    let code_border = Style::default().fg(ui.border).bg(bg_or_reset(code_block_bg));
     let code_header = Style::default()
         .fg(ui.accent)
-        .bg(bg_or_reset(code_bg))
+        .bg(bg_or_reset(code_block_bg))
         .add_modifier(Modifier::BOLD);
     let table_border = Style::default().fg(ui.border);
     let table_header = Style::default().fg(ui.accent).add_modifier(Modifier::BOLD);
@@ -3212,7 +3212,7 @@ fn styles_from_palette(ui: UiPalette) -> (Style, MarkdownStyles) {
             inline_code,
             prefix,
             rule,
-            code_bg,
+            code_block_bg,
             code_border,
             code_header,
             table_border,

@@ -16,7 +16,7 @@ pub struct MarkdownStyles {
     pub inline_code: Style,
     pub prefix: Style,
     pub rule: Style,
-    pub code_bg: Option<Color>,
+    pub code_block_bg: Option<Color>,
     pub code_border: Style,
     pub code_header: Style,
     pub table_border: Style,
@@ -801,10 +801,20 @@ fn render_code_block(
 ) {
     let syntax = resolve_code_syntax(syntax_set, block.language.as_deref());
     let mut highlighter = HighlightLines::new(syntax, theme);
-    let code_bg = styles.code_bg;
+    let code_bg = styles.code_block_bg;
     let border_style = styles.code_border;
     let header_style = styles.code_header;
     let pad_style = Style::default().bg(code_bg.unwrap_or(Color::Reset));
+
+    let mut max_width = 0usize;
+    for line in LinesWithEndings::from(&block.text) {
+        let text = line.trim_end_matches('\n');
+        let width = UnicodeWidthStr::width(text);
+        if width > max_width {
+            max_width = width;
+        }
+    }
+    let inner_width = max_width.saturating_add(2);
 
     let label = block
         .language
@@ -812,16 +822,28 @@ fn render_code_block(
         .filter(|s| !s.is_empty())
         .unwrap_or("code");
     let header = format!(" {label} ");
-    let cap_len = header.chars().count().saturating_add(2);
+    let header_width = UnicodeWidthStr::width(header.as_str());
+    if header_width + 2 <= inner_width {
+        let dashes = inner_width - header_width;
+        let left = dashes / 2;
+        let right = dashes - left;
+        raw_lines.push(Line::from(vec![
+            Span::styled("┌", border_style),
+            Span::styled("─".repeat(left), border_style),
+            Span::styled(header, header_style),
+            Span::styled("─".repeat(right), border_style),
+            Span::styled("┐", border_style),
+        ]));
+    } else {
+        raw_lines.push(Line::from(Span::styled(
+            format!("┌{}┐", "─".repeat(inner_width)),
+            border_style,
+        )));
+    }
     raw_lines.push(Line::from(vec![
-        Span::styled("╭", border_style),
-        Span::styled("─", border_style),
-        Span::styled(header, header_style),
-        Span::styled("╮", border_style),
-    ]));
-    raw_lines.push(Line::from(vec![
-        Span::styled("│ ", border_style),
-        Span::styled(" ", pad_style),
+        Span::styled("│", border_style),
+        Span::styled(" ".repeat(inner_width), pad_style),
+        Span::styled("│", border_style),
     ]));
 
     for line in LinesWithEndings::from(&block.text) {
@@ -830,32 +852,36 @@ fn render_code_block(
             Err(_) => vec![(syntect::highlighting::Style::default(), line)],
         };
         let mut spans = vec![
-            Span::styled("│ ", border_style),
+            Span::styled("│", border_style),
             Span::styled(" ", pad_style),
         ];
+        let mut line_width = 0usize;
         for (style, text) in ranges {
             let text = text.trim_end_matches('\n');
             if text.is_empty() {
                 continue;
             }
+            line_width += UnicodeWidthStr::width(text);
             spans.push(Span::styled(
                 text.to_string(),
                 syntect_to_ratatui(style, code_bg),
             ));
         }
+        if line_width < max_width {
+            spans.push(Span::styled(" ".repeat(max_width - line_width), pad_style));
+        }
         spans.push(Span::styled(" ", pad_style));
+        spans.push(Span::styled("│", border_style));
         raw_lines.push(Line::from(spans));
     }
 
     raw_lines.push(Line::from(vec![
-        Span::styled("│ ", border_style),
-        Span::styled(" ", pad_style),
+        Span::styled("│", border_style),
+        Span::styled(" ".repeat(inner_width), pad_style),
+        Span::styled("│", border_style),
     ]));
-    raw_lines.push(Line::from(vec![
-        Span::styled("╰", border_style),
-        Span::styled("─".repeat(cap_len.saturating_sub(2)), border_style),
-        Span::styled("╯", border_style),
-    ]));
+    let bottom = format!("└{}┘", "─".repeat(inner_width));
+    raw_lines.push(Line::from(Span::styled(bottom, border_style)));
 }
 
 fn resolve_code_syntax<'a>(
