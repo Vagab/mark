@@ -100,4 +100,4 @@ preview_ratio = 55
 
 ## License
 
-MIT
+MIT. See `LICENSE`.
