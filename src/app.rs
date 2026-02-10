@@ -2916,7 +2916,8 @@ impl App {
 
         let highlight = self.search_highlight_style();
         for (line_idx, line) in self.rope.lines().enumerate() {
-            let line_str = line.to_string();
+            let raw_line = line.to_string();
+            let line_str = trim_line_breaks(&raw_line);
             let trimmed = line_str.trim_start();
             let fence = if trimmed.starts_with("```") {
                 Some("```")
@@ -2942,7 +2943,7 @@ impl App {
                 let mut spans = highlight_spans_with(
                     &mut highlighter,
                     &self.syntax_set,
-                    &line_str,
+                    line_str,
                     self.ui.base_bg,
                     self.base_style,
                 );
@@ -2958,7 +2959,7 @@ impl App {
                     let mut spans = highlight_spans_with(
                         highlighter,
                         &self.syntax_set,
-                        &line_str,
+                        line_str,
                         self.ui.base_bg,
                         self.base_style,
                     );
@@ -2968,7 +2969,7 @@ impl App {
                     lines.push(Line::from(spans));
                 } else {
                     lines.push(Line::from(Span::styled(
-                        line_str.trim_end_matches('\n').to_string(),
+                        line_str.to_string(),
                         self.base_style,
                     )));
                 }
@@ -2976,7 +2977,7 @@ impl App {
                 let mut spans = highlight_spans_with(
                     &mut highlighter,
                     &self.syntax_set,
-                    &line_str,
+                    line_str,
                     self.ui.base_bg,
                     self.base_style,
                 );
@@ -3261,7 +3262,7 @@ fn highlight_spans_with(
     };
     let mut spans = Vec::new();
     for (style, text) in ranges {
-        let text = text.trim_end_matches('\n');
+        let text = trim_line_breaks(text);
         if text.is_empty() {
             continue;
         }
@@ -3274,6 +3275,10 @@ fn highlight_spans_with(
         spans.push(Span::styled("", base_style));
     }
     spans
+}
+
+fn trim_line_breaks(text: &str) -> &str {
+    text.trim_end_matches(|c| c == '\n' || c == '\r')
 }
 
 fn resolve_syntax_for_lang<'a>(syntax_set: &'a SyntaxSet, lang: &str) -> &'a syntect::parsing::SyntaxReference {

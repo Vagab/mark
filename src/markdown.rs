@@ -2,6 +2,7 @@ use anyhow::Result;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::borrow::Cow;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme};
 use syntect::parsing::SyntaxSet;
@@ -69,7 +70,8 @@ pub fn parse_markdown(
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
 
-    let parser = Parser::new_ext(input, options);
+    let normalized = normalize_line_endings(input);
+    let parser = Parser::new_ext(normalized.as_ref(), options);
 
     let mut raw_lines: Vec<Line<'static>> = Vec::new();
     let mut headings: Vec<HeadingRaw> = Vec::new();
@@ -110,6 +112,7 @@ pub fn parse_markdown(
                 Tag::TableHead => {
                     if let Some(table) = table.as_mut() {
                         table.in_head = true;
+                        table.saw_head = true;
                     }
                 }
                 Tag::TableRow => {
@@ -192,6 +195,9 @@ pub fn parse_markdown(
                 }
                 TagEnd::TableHead => {
                     if let Some(table) = table.as_mut() {
+                        // Be tolerant of parser event ordering and ensure header row is committed
+                        // before we leave the head section.
+                        table.end_row();
                         table.in_head = false;
                     }
                 }
@@ -226,7 +232,7 @@ pub fn parse_markdown(
             },
             Event::Text(text) => {
                 if let Some(table) = table.as_mut() {
-                    table.push_text(&text);
+                    table.push_text(&text, style_state.inline_style(), tab_width);
                 } else if let Some(h) = heading.as_mut() {
                     h.text.push_str(&text);
                 } else if let Some(block) = code_block.as_mut() {
@@ -241,7 +247,8 @@ pub fn parse_markdown(
             }
             Event::Code(text) => {
                 if let Some(table) = table.as_mut() {
-                    table.push_text(&text);
+                    let inline = styles.inline_code.patch(style_state.inline_style());
+                    table.push_text(&text, inline, tab_width);
                 } else if let Some(h) = heading.as_mut() {
                     h.text.push_str(&text);
                 } else if let Some(block) = code_block.as_mut() {
@@ -256,7 +263,7 @@ pub fn parse_markdown(
             }
             Event::SoftBreak => {
                 if let Some(table) = table.as_mut() {
-                    table.push_break();
+                    table.push_break(style_state.inline_style(), tab_width);
                 } else if let Some(block) = code_block.as_mut() {
                     block.text.push('\n');
                 } else {
@@ -269,7 +276,7 @@ pub fn parse_markdown(
             }
             Event::HardBreak => {
                 if let Some(table) = table.as_mut() {
-                    table.push_break();
+                    table.push_break(style_state.inline_style(), tab_width);
                 } else {
                     flush_line(&mut line, &mut raw_lines);
                 }
@@ -297,6 +304,14 @@ pub fn parse_markdown(
         raw_lines,
         headings,
     })
+}
+
+fn normalize_line_endings(input: &str) -> Cow<'_, str> {
+    if input.contains('\r') {
+        Cow::Owned(input.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(input)
+    }
 }
 
 pub fn wrap_document(
@@ -701,6 +716,11 @@ fn render_table(table: &TableBuilder, styles: &MarkdownStyles, raw_lines: &mut V
             break;
         }
     }
+    if header_len == 0 && table.saw_head && !table.rows.is_empty() {
+        // Defensive fallback: if a header section existed but row flags were lost,
+        // treat the first row as header to preserve expected table structure.
+        header_len = 1;
+    }
 
     for row in table.rows.iter().take(header_len) {
         raw_lines.push(table_row_line(
@@ -763,13 +783,14 @@ fn table_row_line(
     spans.push(Span::styled("│", border_style));
     for idx in 0..widths.len() {
         let text = row.cells.get(idx).map(|s| s.as_str()).unwrap_or("");
+        let inline_style = row.cell_styles.get(idx).copied().unwrap_or_default();
         let align = alignments
             .get(idx)
             .copied()
             .unwrap_or(Alignment::Left);
         let padded = pad_cell(text, widths[idx], align);
         let cell_text = format!(" {padded} ");
-        spans.push(Span::styled(cell_text, cell_style));
+        spans.push(Span::styled(cell_text, cell_style.patch(inline_style)));
         spans.push(Span::styled("│", border_style));
     }
     Line::from(spans)
@@ -966,7 +987,11 @@ impl StyleState {
     }
 
     fn current_style(&self) -> Style {
-        let mut style = self.base;
+        self.base.patch(self.inline_style())
+    }
+
+    fn inline_style(&self) -> Style {
+        let mut style = Style::default();
         if self.underline > 0 {
             style = style
                 .fg(self.link_color)
@@ -1107,6 +1132,7 @@ impl CodeBlock {
 
 struct TableRow {
     cells: Vec<String>,
+    cell_styles: Vec<Style>,
     is_header: bool,
 }
 
@@ -1114,8 +1140,11 @@ struct TableBuilder {
     alignments: Vec<Alignment>,
     rows: Vec<TableRow>,
     current_row: Vec<String>,
+    current_row_styles: Vec<Style>,
     current_cell: String,
+    current_cell_style: Style,
     in_head: bool,
+    saw_head: bool,
 }
 
 impl TableBuilder {
@@ -1124,34 +1153,44 @@ impl TableBuilder {
             alignments,
             rows: Vec::new(),
             current_row: Vec::new(),
+            current_row_styles: Vec::new(),
             current_cell: String::new(),
+            current_cell_style: Style::default(),
             in_head: false,
+            saw_head: false,
         }
     }
 
     fn start_row(&mut self) {
         self.current_row.clear();
+        self.current_row_styles.clear();
         self.current_cell.clear();
+        self.current_cell_style = Style::default();
     }
 
     fn start_cell(&mut self) {
         self.current_cell.clear();
+        self.current_cell_style = Style::default();
     }
 
-    fn push_text(&mut self, text: &str) {
-        self.current_cell.push_str(text);
+    fn push_text(&mut self, text: &str, style: Style, tab_width: usize) {
+        let expanded = expand_tabs(text, tab_width);
+        self.current_cell.push_str(&expanded);
+        self.current_cell_style = self.current_cell_style.patch(style);
     }
 
-    fn push_break(&mut self) {
+    fn push_break(&mut self, style: Style, tab_width: usize) {
         if !self.current_cell.ends_with(' ') {
-            self.current_cell.push(' ');
+            self.push_text(" ", style, tab_width);
         }
     }
 
     fn end_cell(&mut self) {
         let cell = self.current_cell.trim().to_string();
         self.current_row.push(cell);
+        self.current_row_styles.push(self.current_cell_style);
         self.current_cell.clear();
+        self.current_cell_style = Style::default();
     }
 
     fn end_row(&mut self) {
@@ -1163,10 +1202,12 @@ impl TableBuilder {
         }
         let row = TableRow {
             cells: self.current_row.clone(),
+            cell_styles: self.current_row_styles.clone(),
             is_header: self.in_head,
         };
         self.rows.push(row);
         self.current_row.clear();
+        self.current_row_styles.clear();
     }
 }
 
@@ -1197,5 +1238,191 @@ fn bullet_for_depth(depth: usize) -> &'static str {
         1 => "•",
         2 => "◦",
         _ => "▪",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_line_endings, render_table, wrap_line, MarkdownStyles, TableBuilder, TableRow,
+    };
+    use pulldown_cmark::Alignment;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::widgets::Widget;
+    use std::borrow::Cow;
+    use syntect::highlighting::ThemeSet;
+    use syntect::parsing::SyntaxSet;
+
+    #[test]
+    fn normalize_line_endings_preserves_lf_input() {
+        let input = "a\nb\n";
+        let normalized = normalize_line_endings(input);
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+        assert_eq!(normalized.as_ref(), input);
+    }
+
+    #[test]
+    fn normalize_line_endings_converts_crlf_and_cr() {
+        let input = "a\r\nb\rc\r\n";
+        let normalized = normalize_line_endings(input);
+        assert_eq!(normalized.as_ref(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn render_table_respects_detected_header_even_without_row_flag() {
+        let mut table = TableBuilder::new(vec![Alignment::Left, Alignment::Left]);
+        table.saw_head = true;
+        table.rows.push(TableRow {
+            cells: vec!["Key".to_string(), "Action".to_string()],
+            cell_styles: vec![Style::default(), Style::default()],
+            is_header: false,
+        });
+        table.rows.push(TableRow {
+            cells: vec!["a".to_string(), "Add".to_string()],
+            cell_styles: vec![Style::default(), Style::default()],
+            is_header: false,
+        });
+
+        let styles = test_styles();
+        let mut lines = Vec::new();
+        render_table(&table, &styles, &mut lines);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(rendered.iter().any(|l| l.contains(" Key ")));
+        assert!(rendered.iter().any(|l| l.starts_with('├')));
+    }
+
+    #[test]
+    fn render_table_applies_bold_to_header_cells() {
+        let mut table = TableBuilder::new(vec![Alignment::Left, Alignment::Left]);
+        table.rows.push(TableRow {
+            cells: vec!["Key".to_string(), "Action".to_string()],
+            cell_styles: vec![Style::default(), Style::default()],
+            is_header: true,
+        });
+        table.rows.push(TableRow {
+            cells: vec!["a".to_string(), "Add".to_string()],
+            cell_styles: vec![Style::default(), Style::default()],
+            is_header: false,
+        });
+
+        let mut styles = test_styles();
+        styles.table_header = Style::default().add_modifier(Modifier::BOLD);
+        let mut lines = Vec::new();
+        render_table(&table, &styles, &mut lines);
+
+        let header_line = &lines[1];
+        assert!(header_line.spans.iter().any(|span| {
+            span.content.contains("Key")
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn render_table_applies_inline_bold_to_body_cell() {
+        let mut table = TableBuilder::new(vec![Alignment::Left, Alignment::Left]);
+        table.rows.push(TableRow {
+            cells: vec!["Key".to_string(), "Action".to_string()],
+            cell_styles: vec![Style::default(), Style::default()],
+            is_header: true,
+        });
+        table.rows.push(TableRow {
+            cells: vec!["File Operations".to_string(), "".to_string()],
+            cell_styles: vec![
+                Style::default().add_modifier(Modifier::BOLD),
+                Style::default(),
+            ],
+            is_header: false,
+        });
+
+        let styles = test_styles();
+        let mut lines = Vec::new();
+        render_table(&table, &styles, &mut lines);
+
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content.contains("File Operations")
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            })
+        }));
+    }
+
+    #[test]
+    fn wrap_line_preserves_bold_modifier() {
+        let line = Line::from(vec![Span::styled(
+            " Key Action ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]);
+        let wrapped = wrap_line(&line, 4);
+        assert!(!wrapped.is_empty());
+        assert!(wrapped.iter().any(|wrapped_line| {
+            wrapped_line
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        }));
+    }
+
+    #[test]
+    fn paragraph_render_keeps_bold_modifier() {
+        let text = ratatui::text::Text::from(vec![Line::from(vec![Span::styled(
+            "Header",
+            Style::default().add_modifier(Modifier::BOLD),
+        )])]);
+        let paragraph = Paragraph::new(text).style(Style::default().fg(Color::White));
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buf = Buffer::empty(area);
+        paragraph.render(area, &mut buf);
+
+        assert!((0..6).any(|x| buf.get(x, 0).style().add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn parse_markdown_preserves_bold_in_table_cell() {
+        let markdown = "\
+| Key | Action |
+| --- | --- |
+| **File Operations** | Add |
+";
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let themes = ThemeSet::load_defaults();
+        let theme = themes
+            .themes
+            .get("base16-ocean.dark")
+            .expect("default syntect theme");
+        let styles = test_styles();
+
+        let parsed = super::parse_markdown(markdown, &syntax_set, theme, &styles, 4)
+            .expect("parse should succeed");
+        let bold_found = parsed.raw_lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content.contains("File Operations")
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            })
+        });
+        assert!(bold_found);
+    }
+
+    fn test_styles() -> MarkdownStyles {
+        MarkdownStyles {
+            base: Style::default().fg(Color::White),
+            heading: [Style::default(); 6],
+            link_color: Color::Blue,
+            inline_code: Style::default(),
+            prefix: Style::default(),
+            rule: Style::default(),
+            code_block_bg: None,
+            code_border: Style::default(),
+            code_header: Style::default(),
+            table_border: Style::default(),
+            table_header: Style::default(),
+        }
     }
 }
