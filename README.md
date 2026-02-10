@@ -10,8 +10,6 @@
 
 A fast, minimal Markdown reader and editor for the terminal.
 
-> GIF goes here
-
 ## Features
 
 - Markdown preview pane with live reload
