@@ -66,6 +66,7 @@ mark themes list
 - `/` then Enter: search
 - `n` / `N`: next / prev match
 - `[` / `]`: prev / next heading
+- `Enter` on `[text](#anchor)`: jump to anchor
 - `Shift+B`: toggle preview pane
 - `Ctrl+B`: full preview
 - `Alt+Left/Right`: resize preview
@@ -73,6 +74,7 @@ mark themes list
 - `t`: theme picker
 - `?`: help
 - `:w` / `:q` / `:wq`: save / quit
+- `:anchor #id` or `:open #id`: jump to anchor
 - `Ctrl+P` or `:open`: discover files
 
 ## Config

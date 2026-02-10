@@ -696,7 +696,7 @@ fn render_table(table: &TableBuilder, styles: &MarkdownStyles, raw_lines: &mut V
     let mut widths = vec![0usize; column_count];
     for row in &table.rows {
         for (idx, cell) in row.cells.iter().enumerate() {
-            let width = UnicodeWidthStr::width(cell.as_str());
+            let width = UnicodeWidthStr::width(cell.text.as_str());
             widths[idx] = widths[idx].max(width);
         }
     }
@@ -782,34 +782,43 @@ fn table_row_line(
     let mut spans = Vec::new();
     spans.push(Span::styled("│", border_style));
     for idx in 0..widths.len() {
-        let text = row.cells.get(idx).map(|s| s.as_str()).unwrap_or("");
-        let inline_style = row.cell_styles.get(idx).copied().unwrap_or_default();
+        let cell = row.cells.get(idx);
+        let text = cell.map(|c| c.text.as_str()).unwrap_or("");
         let align = alignments
             .get(idx)
             .copied()
             .unwrap_or(Alignment::Left);
-        let padded = pad_cell(text, widths[idx], align);
-        let cell_text = format!(" {padded} ");
-        spans.push(Span::styled(cell_text, cell_style.patch(inline_style)));
+        let text_width = UnicodeWidthStr::width(text);
+        let (left_pad, right_pad) = cell_padding(text_width, widths[idx], align);
+
+        spans.push(Span::styled(" ".repeat(1 + left_pad), cell_style));
+        if let Some(cell) = cell {
+            for fragment in &cell.spans {
+                spans.push(Span::styled(
+                    fragment.text.clone(),
+                    cell_style.patch(fragment.style),
+                ));
+            }
+        }
+        spans.push(Span::styled(" ".repeat(1 + right_pad), cell_style));
         spans.push(Span::styled("│", border_style));
     }
     Line::from(spans)
 }
 
-fn pad_cell(text: &str, width: usize, align: Alignment) -> String {
-    let text_width = UnicodeWidthStr::width(text);
+fn cell_padding(text_width: usize, width: usize, align: Alignment) -> (usize, usize) {
     if width <= text_width {
-        return text.to_string();
+        return (0, 0);
     }
     let pad = width - text_width;
     match align {
-        Alignment::Right => format!("{}{}", " ".repeat(pad), text),
+        Alignment::Right => (pad, 0),
         Alignment::Center => {
             let left = pad / 2;
             let right = pad - left;
-            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+            (left, right)
         }
-        _ => format!("{}{}", text, " ".repeat(pad)),
+        _ => (0, pad),
     }
 }
 
@@ -1130,19 +1139,30 @@ impl CodeBlock {
     }
 }
 
+#[derive(Clone)]
+struct TableSpan {
+    text: String,
+    style: Style,
+}
+
+#[derive(Clone)]
+struct TableCell {
+    text: String,
+    spans: Vec<TableSpan>,
+}
+
+#[derive(Clone)]
 struct TableRow {
-    cells: Vec<String>,
-    cell_styles: Vec<Style>,
+    cells: Vec<TableCell>,
     is_header: bool,
 }
 
 struct TableBuilder {
     alignments: Vec<Alignment>,
     rows: Vec<TableRow>,
-    current_row: Vec<String>,
-    current_row_styles: Vec<Style>,
+    current_row: Vec<TableCell>,
     current_cell: String,
-    current_cell_style: Style,
+    current_cell_spans: Vec<TableSpan>,
     in_head: bool,
     saw_head: bool,
 }
@@ -1153,9 +1173,8 @@ impl TableBuilder {
             alignments,
             rows: Vec::new(),
             current_row: Vec::new(),
-            current_row_styles: Vec::new(),
             current_cell: String::new(),
-            current_cell_style: Style::default(),
+            current_cell_spans: Vec::new(),
             in_head: false,
             saw_head: false,
         }
@@ -1163,20 +1182,31 @@ impl TableBuilder {
 
     fn start_row(&mut self) {
         self.current_row.clear();
-        self.current_row_styles.clear();
         self.current_cell.clear();
-        self.current_cell_style = Style::default();
+        self.current_cell_spans.clear();
     }
 
     fn start_cell(&mut self) {
         self.current_cell.clear();
-        self.current_cell_style = Style::default();
+        self.current_cell_spans.clear();
     }
 
     fn push_text(&mut self, text: &str, style: Style, tab_width: usize) {
         let expanded = expand_tabs(text, tab_width);
+        if expanded.is_empty() {
+            return;
+        }
         self.current_cell.push_str(&expanded);
-        self.current_cell_style = self.current_cell_style.patch(style);
+        if let Some(last) = self.current_cell_spans.last_mut() {
+            if last.style == style {
+                last.text.push_str(&expanded);
+                return;
+            }
+        }
+        self.current_cell_spans.push(TableSpan {
+            text: expanded,
+            style,
+        });
     }
 
     fn push_break(&mut self, style: Style, tab_width: usize) {
@@ -1187,10 +1217,10 @@ impl TableBuilder {
 
     fn end_cell(&mut self) {
         let cell = self.current_cell.trim().to_string();
-        self.current_row.push(cell);
-        self.current_row_styles.push(self.current_cell_style);
+        let spans = trim_table_spans(&self.current_cell_spans);
+        self.current_row.push(TableCell { text: cell, spans });
         self.current_cell.clear();
-        self.current_cell_style = Style::default();
+        self.current_cell_spans.clear();
     }
 
     fn end_row(&mut self) {
@@ -1202,12 +1232,10 @@ impl TableBuilder {
         }
         let row = TableRow {
             cells: self.current_row.clone(),
-            cell_styles: self.current_row_styles.clone(),
             is_header: self.in_head,
         };
         self.rows.push(row);
         self.current_row.clear();
-        self.current_row_styles.clear();
     }
 }
 
@@ -1241,10 +1269,61 @@ fn bullet_for_depth(depth: usize) -> &'static str {
     }
 }
 
+fn trim_table_spans(spans: &[TableSpan]) -> Vec<TableSpan> {
+    let mut styled_chars: Vec<(char, Style)> = Vec::new();
+    for span in spans {
+        for ch in span.text.chars() {
+            styled_chars.push((ch, span.style));
+        }
+    }
+    if styled_chars.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(start) = styled_chars.iter().position(|(ch, _)| !ch.is_whitespace()) else {
+        return Vec::new();
+    };
+    let end = styled_chars
+        .iter()
+        .rposition(|(ch, _)| !ch.is_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(start);
+    if start >= end {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut current_style = styled_chars[start].1;
+    let mut current_text = String::new();
+
+    for (ch, style) in styled_chars[start..end].iter().copied() {
+        if style != current_style {
+            if !current_text.is_empty() {
+                out.push(TableSpan {
+                    text: std::mem::take(&mut current_text),
+                    style: current_style,
+                });
+            }
+            current_style = style;
+        }
+        current_text.push(ch);
+    }
+
+    if !current_text.is_empty() {
+        out.push(TableSpan {
+            text: current_text,
+            style: current_style,
+        });
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_line_endings, render_table, wrap_line, MarkdownStyles, TableBuilder, TableRow,
+        normalize_line_endings, render_table, wrap_line, MarkdownStyles, TableBuilder, TableCell,
+        TableRow, TableSpan,
     };
     use pulldown_cmark::Alignment;
     use ratatui::buffer::Buffer;
@@ -1277,13 +1356,17 @@ mod tests {
         let mut table = TableBuilder::new(vec![Alignment::Left, Alignment::Left]);
         table.saw_head = true;
         table.rows.push(TableRow {
-            cells: vec!["Key".to_string(), "Action".to_string()],
-            cell_styles: vec![Style::default(), Style::default()],
+            cells: vec![
+                table_cell("Key", Style::default()),
+                table_cell("Action", Style::default()),
+            ],
             is_header: false,
         });
         table.rows.push(TableRow {
-            cells: vec!["a".to_string(), "Add".to_string()],
-            cell_styles: vec![Style::default(), Style::default()],
+            cells: vec![
+                table_cell("a", Style::default()),
+                table_cell("Add", Style::default()),
+            ],
             is_header: false,
         });
 
@@ -1303,13 +1386,17 @@ mod tests {
     fn render_table_applies_bold_to_header_cells() {
         let mut table = TableBuilder::new(vec![Alignment::Left, Alignment::Left]);
         table.rows.push(TableRow {
-            cells: vec!["Key".to_string(), "Action".to_string()],
-            cell_styles: vec![Style::default(), Style::default()],
+            cells: vec![
+                table_cell("Key", Style::default()),
+                table_cell("Action", Style::default()),
+            ],
             is_header: true,
         });
         table.rows.push(TableRow {
-            cells: vec!["a".to_string(), "Add".to_string()],
-            cell_styles: vec![Style::default(), Style::default()],
+            cells: vec![
+                table_cell("a", Style::default()),
+                table_cell("Add", Style::default()),
+            ],
             is_header: false,
         });
 
@@ -1329,15 +1416,16 @@ mod tests {
     fn render_table_applies_inline_bold_to_body_cell() {
         let mut table = TableBuilder::new(vec![Alignment::Left, Alignment::Left]);
         table.rows.push(TableRow {
-            cells: vec!["Key".to_string(), "Action".to_string()],
-            cell_styles: vec![Style::default(), Style::default()],
+            cells: vec![
+                table_cell("Key", Style::default()),
+                table_cell("Action", Style::default()),
+            ],
             is_header: true,
         });
         table.rows.push(TableRow {
-            cells: vec!["File Operations".to_string(), "".to_string()],
-            cell_styles: vec![
-                Style::default().add_modifier(Modifier::BOLD),
-                Style::default(),
+            cells: vec![
+                table_cell("File Operations", Style::default().add_modifier(Modifier::BOLD)),
+                table_cell("", Style::default()),
             ],
             is_header: false,
         });
@@ -1408,6 +1496,20 @@ mod tests {
             })
         });
         assert!(bold_found);
+    }
+
+    fn table_cell(text: &str, style: Style) -> TableCell {
+        TableCell {
+            text: text.to_string(),
+            spans: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![TableSpan {
+                    text: text.to_string(),
+                    style,
+                }]
+            },
+        }
     }
 
     fn test_styles() -> MarkdownStyles {

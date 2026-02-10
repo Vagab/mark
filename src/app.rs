@@ -959,6 +959,39 @@ impl App {
         self.jump_to_match(self.current_match);
     }
 
+    fn jump_to_anchor_target(&mut self, target: &str) -> bool {
+        let Some(anchor) = normalize_anchor_target(target) else {
+            self.status = Some(format!("Invalid anchor target: {target}"));
+            return false;
+        };
+        let Some(line) = resolve_anchor_line(&anchor, &self.rendered, self.scroll) else {
+            self.status = Some(format!("Anchor not found: #{anchor}"));
+            return false;
+        };
+
+        self.set_rendered_cursor_line(line);
+        if self.show_preview || self.preview_full {
+            self.ensure_rendered_cursor_visible(self.last_height.max(1));
+        }
+        self.status = Some(format!("Anchor: #{anchor}"));
+        true
+    }
+
+    fn follow_anchor_under_cursor(&mut self) {
+        let (line_idx, col) = self.cursor_line_col();
+        let mut line = self.rope.line(line_idx).to_string();
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        let Some(target) = find_anchor_link_under_cursor(&line, col) else {
+            return;
+        };
+        self.jump_to_anchor_target(&target);
+    }
+
     fn request_reload(&mut self) {
         self.reload.pending = true;
         self.reload.deadline = Some(Instant::now() + Duration::from_millis(150));
@@ -1360,6 +1393,7 @@ impl App {
             }
             KeyCode::Char('n') => self.jump_match(1),
             KeyCode::Char('N') => self.jump_match(-1),
+            KeyCode::Enter => self.follow_anchor_under_cursor(),
             KeyCode::Char('t') => {
                 self.mode = Mode::ThemePicker;
                 self.theme_before_picker = Some(self.config.theme.clone());
@@ -2118,6 +2152,35 @@ impl App {
             return false;
         }
 
+        if let Some(rest) = cmd.strip_prefix("anchor ") {
+            self.mode = Mode::Normal;
+            let target = rest.trim();
+            if target.is_empty() {
+                self.status = Some("Usage: :anchor #section".to_string());
+            } else {
+                self.jump_to_anchor_target(target);
+            }
+            return false;
+        }
+
+        if let Some(rest) = cmd.strip_prefix("open ") {
+            self.mode = Mode::Normal;
+            let target = rest.trim();
+            if target.is_empty() {
+                self.request_discover = true;
+                return true;
+            }
+            if target.contains('#') {
+                self.jump_to_anchor_target(target);
+            } else {
+                self.status = Some(
+                    "Use :open for discover or :open #anchor for in-document navigation"
+                        .to_string(),
+                );
+            }
+            return false;
+        }
+
         match cmd {
             "w" | "write" | "w!" => {
                 self.save_buffer();
@@ -2142,6 +2205,10 @@ impl App {
             "q!" | "quit!" => {
                 self.discard_changes();
                 return true;
+            }
+            "anchor" => {
+                self.status = Some("Usage: :anchor #section".to_string());
+                self.mode = Mode::Normal;
             }
             "discover" | "files" | "open" => {
                 self.request_discover = true;
@@ -2617,6 +2684,155 @@ fn find_anchor(anchor: &str, lines: &[String], prev_scroll: usize) -> Option<usi
     best.map(|(idx, _)| idx)
 }
 
+fn normalize_anchor_target(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let anchor = if let Some(rest) = trimmed.strip_prefix('#') {
+        rest
+    } else if let Some((_, frag)) = trimmed.rsplit_once('#') {
+        frag
+    } else {
+        trimmed
+    };
+    let slug = slugify_anchor(anchor);
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
+fn resolve_anchor_line(anchor: &str, rendered: &RenderedDocument, prev_scroll: usize) -> Option<usize> {
+    if let Some(line) = find_heading_anchor_line(anchor, &rendered.headings, prev_scroll) {
+        return Some(line);
+    }
+
+    let raw = anchor.trim().trim_start_matches('#');
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Some(line) = find_anchor(raw, &rendered.plain_lines, prev_scroll) {
+        return Some(line);
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+    for (idx, line) in rendered.plain_lines.iter().enumerate() {
+        if slugify_anchor(line) != anchor {
+            continue;
+        }
+        let dist = idx.abs_diff(prev_scroll);
+        match best {
+            Some((_, best_dist)) if dist >= best_dist => {}
+            _ => best = Some((idx, dist)),
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
+fn find_heading_anchor_line(anchor: &str, headings: &[Heading], prev_scroll: usize) -> Option<usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut best: Option<(usize, usize)> = None;
+
+    for heading in headings {
+        let base = slugify_anchor(&heading.title);
+        if base.is_empty() {
+            continue;
+        }
+        let count = counts.entry(base.clone()).or_insert(0);
+        let slug = if *count == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{count}")
+        };
+        *count += 1;
+
+        if slug != anchor && base != anchor {
+            continue;
+        }
+
+        let dist = heading.line.abs_diff(prev_scroll);
+        match best {
+            Some((_, best_dist)) if dist >= best_dist => {}
+            _ => best = Some((heading.line, dist)),
+        }
+    }
+
+    best.map(|(line, _)| line)
+}
+
+fn slugify_anchor(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+            continue;
+        }
+        if ch.is_whitespace() || ch == '-' || ch == '_' {
+            if !out.is_empty() && !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn find_anchor_link_under_cursor(line: &str, cursor_col: usize) -> Option<String> {
+    if line.is_empty() {
+        return None;
+    }
+
+    let cursor_byte = char_to_byte_idx(line, cursor_col);
+    let mut i = 0usize;
+    while i < line.len() {
+        let mut chars = line[i..].chars();
+        let Some(ch) = chars.next() else {
+            break;
+        };
+        if ch == '[' {
+            let after_open = i + ch.len_utf8();
+            let Some(close_rel) = line[after_open..].find(']') else {
+                i = after_open;
+                continue;
+            };
+            let close = after_open + close_rel;
+            if close + 1 < line.len() && line[close + 1..].starts_with('(') {
+                let target_start = close + 2;
+                if let Some(end_rel) = line[target_start..].find(')') {
+                    let target_end = target_start + end_rel;
+                    if cursor_byte >= i && cursor_byte <= target_end {
+                        let target = line[target_start..target_end].trim();
+                        if target.contains('#') {
+                            return Some(target.to_string());
+                        }
+                    }
+                    i = target_end + 1;
+                    continue;
+                }
+            }
+            i = close + 1;
+            continue;
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn char_to_byte_idx(text: &str, col: usize) -> usize {
+    if col == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
 fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
     let highlight_fg = app.ui.base_bg.unwrap_or(app.ui.base_fg);
     let highlight_style = Style::default().bg(app.ui.accent).fg(highlight_fg);
@@ -2724,12 +2940,14 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, layout: &LayoutInfo) {
             Line::from("  /: search"),
             Line::from("  n/N: next/prev match"),
             Line::from("  [/]: prev/next heading"),
+            Line::from("  Enter on [link](#anchor): jump to anchor"),
             Line::from("  Shift+B: toggle preview pane"),
             Line::from("  Ctrl+B: preview full screen"),
             Line::from("  Alt+Left/Right: resize preview"),
             Line::from("  H: toggle outline"),
             Line::from("  t: theme picker"),
             Line::from("  :w/:q/:wq: save/quit"),
+            Line::from("  :anchor #id or :open #id: jump to anchor"),
             Line::from("  Ctrl+P or :open: discover files"),
             Line::from("  i/a/o: insert"),
             Line::from("  v/V: visual"),
@@ -3771,4 +3989,40 @@ fn strip_inline_markdown(line: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_anchor_link_under_cursor, normalize_anchor_target, slugify_anchor};
+
+    #[test]
+    fn slugify_anchor_matches_heading_style() {
+        assert_eq!(
+            slugify_anchor("NvimTree - File Explorer"),
+            "nvimtree-file-explorer"
+        );
+        assert_eq!(slugify_anchor("###  Hello, World!  "), "hello-world");
+    }
+
+    #[test]
+    fn normalize_anchor_target_extracts_fragment() {
+        assert_eq!(
+            normalize_anchor_target("#nvimtree"),
+            Some("nvimtree".to_string())
+        );
+        assert_eq!(
+            normalize_anchor_target("README.md#nvimtree-file-explorer"),
+            Some("nvimtree-file-explorer".to_string())
+        );
+    }
+
+    #[test]
+    fn find_anchor_link_under_cursor_returns_anchor_target() {
+        let line = "See [NvimTree](#nvimtree-file-explorer) next.";
+        assert_eq!(
+            find_anchor_link_under_cursor(line, 8),
+            Some("#nvimtree-file-explorer".to_string())
+        );
+        assert_eq!(find_anchor_link_under_cursor(line, 0), None);
+    }
 }
